@@ -88,6 +88,69 @@ def _type_bounds(t: IntegerType) -> tuple[int, int]:
     return lo, hi
 
 
+def _effective_mul_factor(expr, var_name: str) -> int | None:
+    """
+    Return the total constant multiplication factor accumulated on top of
+    var_name in expr, or None if var_name doesn't appear in expr.
+
+    For ((v * 95) * 95) * 81:  returns 95 * 95 * 81 = 731,025
+    Only follows MUL chains where one side is purely constant at each step.
+    """
+    from src.ir.nodes import BinaryExpression as IRBin, Variable as IRVar, Operator as IROp
+    if isinstance(expr, IRVar):
+        return 1 if expr.name == var_name else None
+    if isinstance(expr, IRBin) and expr.op == IROp.MUL:
+        lc = _fold_expr_constant(expr.lhs)
+        rc = _fold_expr_constant(expr.rhs)
+        if rc is not None:
+            sub = _effective_mul_factor(expr.lhs, var_name)
+            if sub is not None:
+                return abs(rc) * sub
+        if lc is not None:
+            sub = _effective_mul_factor(expr.rhs, var_name)
+            if sub is not None:
+                return abs(lc) * sub
+    return None
+
+
+def _collect_mul_factors(circuit: Circuit) -> dict[str, int]:
+    """
+    Walk all assertions and return, for each INTEGER variable, the maximum
+    effective multiplication factor seen in any MUL chain containing it.
+    """
+    from src.ir.nodes import (
+        BinaryExpression as IRBin, UnaryExpression as IRUnary,
+        TernaryExpression as IRTernary, Assertion, Variable as IRVar, Operator as IROp,
+    )
+    factors: dict[str, int] = {}
+
+    def _update(name: str, factor: int) -> None:
+        factors[name] = max(factors.get(name, 1), factor)
+
+    def _walk(node) -> None:
+        if isinstance(node, IRBin):
+            if node.op == IROp.MUL:
+                # Try to find a variable on either side and compute its factor.
+                for var in circuit.inputs:
+                    if var.variable_type != VariableType.INTEGER:
+                        continue
+                    f = _effective_mul_factor(node, var.name)
+                    if f is not None and f > 1:
+                        _update(var.name, f)
+            _walk(node.lhs)
+            _walk(node.rhs)
+        elif isinstance(node, IRUnary):
+            _walk(node.value)
+        elif isinstance(node, IRTernary):
+            _walk(node.condition); _walk(node.if_expr); _walk(node.else_expr)
+        elif isinstance(node, Assertion):
+            _walk(node.value)
+
+    for stmt in circuit.statements:
+        _walk(stmt)
+    return factors
+
+
 def _collect_var_const_ranges(circuit: Circuit) -> dict[str, tuple[int, int]]:
     """
     Walk every assertion in the circuit and collect, for each INTEGER variable,
@@ -148,23 +211,28 @@ def assign_int_types(
     """
     Deterministically assign a Noir integer type to each Int variable.
 
-    The seed comes from the SMT content for reproducibility.  For each
-    variable the pool is filtered to only types whose range covers every
-    integer literal that appears as a direct sibling of that variable in
-    a binary expression — preventing spurious Z3 UNSAT from tight bounds.
-    Falls back to i64 when no type in the pool fits.
+    Filters the type pool by two constraints per variable:
+    1. Direct-sibling constant range: type must cover all constants directly
+       compared with / added to the variable.
+    2. Effective multiplication factor K: type.max // K >= 1, so the full
+       chain v * K never overflows (Z3 bounds will be clamped to ±type.max//K).
+    Falls back to i64 when nothing else fits.
     """
     seed = int(hashlib.md5(smt_content.encode()).hexdigest(), 16)
     rng = random.Random(seed)
 
     const_ranges = _collect_var_const_ranges(circuit) if circuit else {}
+    mul_factors  = _collect_mul_factors(circuit)       if circuit else {}
 
     result: dict[str, IntegerType] = {}
     for name in int_var_names:
         min_c, max_c = const_ranges.get(name, (0, 0))
+        k = mul_factors.get(name, 1)
         valid = [
             t for t in _INT_TYPE_POOL
-            if _type_bounds(t)[0] <= min_c and _type_bounds(t)[1] >= max_c
+            if _type_bounds(t)[0] <= min_c
+            and _type_bounds(t)[1] >= max_c
+            and _type_bounds(t)[1] // k >= 1   # product chain fits in type
         ]
         result[name] = rng.choice(valid) if valid else IntegerType(64, True)
 
@@ -214,12 +282,25 @@ def _blocking_clause(model: dict[str, tuple[str, str]], declared: set[str]) -> s
     return f"(assert (not {body}))"
 
 
-def _bounds_clauses(int_vars: set[str], type_map: dict[str, IntegerType]) -> list[str]:
-    """Return (assert ...) clauses constraining each integer variable to its type's range."""
+def _bounds_clauses(
+    int_vars: set[str],
+    type_map: dict[str, IntegerType],
+    mul_factors: dict[str, int] | None = None,
+) -> list[str]:
+    """
+    Return (assert ...) clauses bounding each integer variable.
+    When a multiplication factor K > 1 is known for a variable, the bound is
+    clamped to ±type.max//K so that v * K never overflows the assigned type.
+    """
+    factors = mul_factors or {}
     clauses = []
     for v in sorted(int_vars):
         t = type_map.get(v, IntegerType(64, True))
         lo, hi = _type_bounds(t)
+        k = factors.get(v, 1)
+        if k > 1:
+            safe = hi // k
+            lo, hi = -safe, safe
         clauses.append(f"(assert (>= {v} {lo}))")
         clauses.append(f"(assert (<= {v} {hi}))")
     return clauses
@@ -232,16 +313,17 @@ def enumerate_models(
     timeout: int = 30,
     int_vars: set[str] | None = None,
     int_type_map: dict[str, IntegerType] | None = None,
+    mul_factors: dict[str, int] | None = None,
 ) -> list[dict[str, tuple[str, str]]]:
     """
     Call Z3 repeatedly with blocking clauses to collect up to max_models
     satisfying assignments.
 
     Bounds for each integer variable are derived from its assigned Noir type
-    so every model is guaranteed to be a valid witness.
+    and clamped by the effective multiplication factor to prevent overflow.
     """
     base = _strip_check_commands(smt_content)
-    bounds = _bounds_clauses(int_vars or set(), int_type_map or {})
+    bounds = _bounds_clauses(int_vars or set(), int_type_map or {}, mul_factors)
     extra: list[str] = bounds[:]
     models: list[dict[str, tuple[str, str]]] = []
 
@@ -366,11 +448,14 @@ def run_nargo_execute(project_dir: Path, timeout: int = 120) -> tuple[bool, str]
 # ---------------------------------------------------------------------------
 
 def generate_smt(config: dict, timeout: int = 30) -> str:
-    """Call smtfuzz with flags from config dict and return the generated formula."""
+    """Call smtfuzz with flags from config dict and return the generated formula.
+    List values are resolved by picking one element at random (allows e.g. multiple logics)."""
     cmd = ["smtfuzz"]
     for key, value in config.items():
         if value is None:
             continue
+        if isinstance(value, list):
+            value = random.choice(value)
         cmd += [f"--{key}", str(value)]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
@@ -393,8 +478,11 @@ def build_boundary_prover_toml(
     circuit,
     int_type_map: dict[str, IntegerType],
     rng: random.Random,
+    mul_factors: dict[str, int] | None = None,
 ) -> str:
-    """Build a Prover.toml by sampling boundary values for each variable."""
+    """Build a Prover.toml by sampling boundary values for each variable.
+    Integer bounds are clamped by the multiplication factor to prevent overflow."""
+    factors = mul_factors or {}
     lines: list[str] = []
     for var in circuit.inputs:
         name = var.name
@@ -402,7 +490,14 @@ def build_boundary_prover_toml(
             lines.append(f"{name} = {rng.choice(['true', 'false'])}")
         else:
             t = int_type_map.get(name, IntegerType(64, True))
-            val = rng.choice(_boundary_values(t))
+            lo, hi = _type_bounds(t)
+            k = factors.get(name, 1)
+            if k > 1:
+                safe = hi // k
+                lo, hi = -safe, safe
+            candidates = [lo, lo + 1, -1, 0, 1, hi - 1, hi]
+            pool = sorted(set(v for v in candidates if lo <= v <= hi))
+            val = rng.choice(pool)
             lines.append(f'{name} = "{val}"')
     return "\n".join(lines) + "\n"
 
@@ -545,11 +640,13 @@ def main() -> None:
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     run_id  = secrets.token_hex(4)
     run_dir = output_dir / f"run-{timestamp}-{run_id}"
-    sat_dir    = run_dir / "out" / "sat"
-    unsat_dir  = run_dir / "out" / "unsat"
-    errors_dir = run_dir / "errors"
+    sat_dir          = run_dir / "out" / "sat"
+    unsat_dir        = run_dir / "out" / "unsat"
+    sat_to_unsat_dir = run_dir / "out" / "sat_to_unsat"
+    errors_dir       = run_dir / "errors"
     sat_dir.mkdir(parents=True, exist_ok=True)
     unsat_dir.mkdir(parents=True, exist_ok=True)
+    sat_to_unsat_dir.mkdir(parents=True, exist_ok=True)
     (errors_dir / "error").mkdir(parents=True, exist_ok=True)
     (errors_dir / "timeout").mkdir(parents=True, exist_ok=True)
 
@@ -604,7 +701,9 @@ def main() -> None:
         int_vars = set(int_var_names)
 
         int_type_map: dict[str, IntegerType] = {}
+        mul_factors: dict[str, int] = {}
         if int_var_names:
+            mul_factors  = _collect_mul_factors(circuit)
             int_type_map = assign_int_types(int_var_names, smt_content, circuit)
             types_summary = ", ".join(f"{n}:{t}" for n, t in int_type_map.items())
             print(f"  Types: {types_summary}")
@@ -627,6 +726,7 @@ def main() -> None:
                 timeout=args.z3_timeout,
                 int_vars=int_vars,
                 int_type_map=int_type_map,
+                mul_factors=mul_factors,
             )
         except subprocess.TimeoutExpired:
             print("  SKIP (Z3 timed out)")
@@ -647,7 +747,7 @@ def main() -> None:
                 folder_name = f"obj.{stem}-{idx}"
                 pkg_name    = _sanitize_name(folder_name)
                 project_dir = unsat_dir / folder_name
-                boundary_toml = build_boundary_prover_toml(circuit, int_type_map, rng_unsat)
+                boundary_toml = build_boundary_prover_toml(circuit, int_type_map, rng_unsat, mul_factors)
                 create_noir_project(project_dir, noir_source, boundary_toml, pkg_name,
                                     smt_source=smt_content, smt_filename=smt_filename)
                 print(f"  [{folder_name}] unsat boundary  ... ", end="", flush=True)
@@ -707,15 +807,14 @@ def main() -> None:
                     smt_content, circuit, model, int_vars, int_type_map)
                 if oracle_model is not None:
                     oracle_toml = model_to_prover_toml(oracle_model, circuit)
-                    with tempfile.TemporaryDirectory() as tmp:
-                        tmp_dir = Path(tmp) / folder_name
-                        create_noir_project(tmp_dir, noir_source, oracle_toml, pkg_name,
-                                            smt_source=smt_content, smt_filename=smt_filename)
-                        print(f"  [{folder_name}] sat oracle      ... ", end="", flush=True)
-                        try:
-                            o_ok, o_out = run_nargo_execute(tmp_dir, timeout=args.nargo_timeout)
-                        except subprocess.TimeoutExpired:
-                            o_ok, o_out = False, ""
+                    oracle_dir = sat_to_unsat_dir / folder_name
+                    create_noir_project(oracle_dir, noir_source, oracle_toml, pkg_name,
+                                        smt_source=smt_content, smt_filename=smt_filename)
+                    print(f"  [{folder_name}] sat oracle      ... ", end="", flush=True)
+                    try:
+                        o_ok, o_out = run_nargo_execute(oracle_dir, timeout=args.nargo_timeout)
+                    except subprocess.TimeoutExpired:
+                        o_ok, o_out = False, ""
                     if o_ok:
                         print("BUG")
                         n_error += 1
