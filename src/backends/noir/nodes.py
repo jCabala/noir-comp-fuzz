@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from dataclasses import field
 
 from .operators import Operator
-from .types import NoirType
+from .types import NoirType, IntegerType
 
 
 @dataclass
@@ -72,6 +72,15 @@ class StringLiteral(Expression):
 
     def copy(self) -> "StringLiteral":
         return StringLiteral(self.value)
+
+
+@dataclass
+class CastExpression(Expression):
+    expr: Expression
+    type_: IntegerType
+
+    def copy(self) -> "CastExpression":
+        return CastExpression(self.expr.copy(), self.type_.copy())
 
 
 @dataclass

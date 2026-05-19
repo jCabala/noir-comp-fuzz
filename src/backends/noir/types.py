@@ -29,6 +29,18 @@ class FieldType(NoirType):
 
 
 @dataclass
+class IntegerType(NoirType):
+    bits: int = 64
+    signed: bool = True
+
+    def copy(self) -> "IntegerType":
+        return IntegerType(self.bits, self.signed)
+
+    def __str__(self) -> str:
+        return f"{'i' if self.signed else 'u'}{self.bits}"
+
+
+@dataclass
 class TupleType(NoirType):
     elems: list[NoirType]
 

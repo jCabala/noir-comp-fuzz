@@ -1,0 +1,30 @@
+# Run output (witnesses, errors, bugs)
+obj/
+
+# smtfuzz playground
+playground/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Nargo / Noir build artifacts
+target/
+*.gz
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db

@@ -11,6 +11,7 @@ from src.ir.nodes import (
     Boolean,
     UnaryExpression,
     BinaryExpression,
+    TernaryExpression,
     Operator,
     VariableType,
 )
@@ -338,6 +339,189 @@ def parse_smtlib2_ff(smtlib2: str) -> Circuit:
     )
 
 
+def parse_smtlib2_lia(smtlib2: str) -> Circuit:
+    """
+    Parse a QF_LIA (quantifier-free linear integer arithmetic) SMT-LIB v2
+    formula into a Circuit IR.
+
+    Supported:
+      - (declare-fun x () Bool) / (declare-fun x () Int)
+      - Boolean connectives: and, or, not, xor, =>
+      - Arithmetic: +, -, *, (- expr) unary negation
+      - Absolute value: (abs expr)  — constant-folded for literals
+      - Comparisons: =, distinct, <, <=, >, >=  (n-ary chained)
+      - Conditional: ite
+      - let bindings
+    """
+    cleaned = _strip_smt_comments(smtlib2)
+    forms = _parse_script(cleaned)
+
+    declared_bool: set[str] = set()
+    declared_int: set[str] = set()
+    inputs: list[Variable] = []
+    assertions: list[Assertion] = []
+
+    def _fold_left(opcode: Operator, exprs: list[Expression]) -> Expression:
+        out = exprs[0]
+        for e in exprs[1:]:
+            out = BinaryExpression(opcode, out, e)
+        return out
+
+    def _chain(opcode: Operator, args: list[Expression]) -> Expression:
+        """a OP b OP c  →  (a OP b) && (b OP c)"""
+        pairs = [BinaryExpression(opcode, args[i], args[i + 1]) for i in range(len(args) - 1)]
+        return _fold_left(Operator.LAND, pairs) if len(pairs) > 1 else pairs[0]
+
+    def _expr(node, env: dict | None = None) -> Expression:
+        if env is None:
+            env = {}
+
+        # --- atom ---
+        if isinstance(node, str):
+            if node in env:
+                return env[node]
+            if node == "true":
+                return Boolean(True)
+            if node == "false":
+                return Boolean(False)
+            try:
+                return Integer(int(node))
+            except ValueError:
+                pass
+            if node in declared_bool:
+                return Variable(node, VariableType.BOOLEAN)
+            if node in declared_int:
+                return Variable(node, VariableType.INTEGER)
+            raise ValueError(f"Unknown symbol in QF_LIA expression: {node!r}")
+
+        if not node:
+            raise ValueError("Empty expression in QF_LIA")
+
+        head = node[0]
+
+        # --- Boolean connectives ---
+        if head == "and":
+            args = [_expr(a, env) for a in node[1:]]
+            return _fold_left(Operator.LAND, args) if len(args) > 1 else args[0]
+
+        if head == "or":
+            args = [_expr(a, env) for a in node[1:]]
+            return _fold_left(Operator.LOR, args) if len(args) > 1 else args[0]
+
+        if head == "not":
+            return UnaryExpression(Operator.NOT, _expr(node[1], env))
+
+        if head == "xor":
+            args = [_expr(a, env) for a in node[1:]]
+            return _fold_left(Operator.LXOR, args) if len(args) > 1 else args[0]
+
+        if head == "=>":
+            a, b = _expr(node[1], env), _expr(node[2], env)
+            return BinaryExpression(Operator.LOR, UnaryExpression(Operator.NOT, a), b)
+
+        # --- Equality / comparison (n-ary) ---
+        if head == "=":
+            args = [_expr(a, env) for a in node[1:]]
+            return _chain(Operator.EQU, args)
+
+        if head == "distinct":
+            args = [_expr(a, env) for a in node[1:]]
+            pairs = [
+                UnaryExpression(Operator.NOT, BinaryExpression(Operator.EQU, args[i], args[j]))
+                for i in range(len(args))
+                for j in range(i + 1, len(args))
+            ]
+            return _fold_left(Operator.LAND, pairs) if len(pairs) > 1 else pairs[0]
+
+        if head == "<":
+            return _chain(Operator.LTH, [_expr(a, env) for a in node[1:]])
+
+        if head == "<=":
+            return _chain(Operator.LEQ, [_expr(a, env) for a in node[1:]])
+
+        if head == ">":
+            return _chain(Operator.GTH, [_expr(a, env) for a in node[1:]])
+
+        if head == ">=":
+            return _chain(Operator.GEQ, [_expr(a, env) for a in node[1:]])
+
+        # --- Arithmetic ---
+        if head == "+":
+            args = [_expr(a, env) for a in node[1:]]
+            return _fold_left(Operator.ADD, args) if len(args) > 1 else args[0]
+
+        if head == "-":
+            if len(node) == 2:
+                inner = _expr(node[1], env)
+                if isinstance(inner, Integer):
+                    return Integer(-inner.value)
+                return UnaryExpression(Operator.SUB, inner)
+            args = [_expr(a, env) for a in node[1:]]
+            return _fold_left(Operator.SUB, args) if len(args) > 1 else args[0]
+
+        if head == "*":
+            args = [_expr(a, env) for a in node[1:]]
+            return _fold_left(Operator.MUL, args) if len(args) > 1 else args[0]
+
+        if head == "abs":
+            inner = _expr(node[1], env)
+            if isinstance(inner, Integer):
+                return Integer(abs(inner.value))
+            zero = Integer(0)
+            cond = BinaryExpression(Operator.GEQ, inner, zero)
+            return TernaryExpression(cond, inner, UnaryExpression(Operator.SUB, inner))
+
+        # --- Conditional ---
+        if head == "ite":
+            return TernaryExpression(
+                _expr(node[1], env),
+                _expr(node[2], env),
+                _expr(node[3], env),
+            )
+
+        # --- let ---
+        if head == "let":
+            bindings, body = node[1], node[2]
+            new_env = {**env, **{b[0]: _expr(b[1], env) for b in bindings}}
+            return _expr(body, new_env)
+
+        raise ValueError(f"Unsupported QF_LIA operator: {head!r}")
+
+    for form in forms:
+        if not form:
+            continue
+        head = form[0]
+        if head in ("set-logic", "check-sat", "exit", "get-model", "get-value"):
+            continue
+        if head in ("declare-fun", "declare-const"):
+            name = form[1]
+            # (declare-fun name () Sort)  → form[3] is 'Bool' or 'Int'
+            # (declare-const name Sort)   → form[2] is 'Bool' or 'Int'
+            sort = form[3] if len(form) > 3 else form[2]
+            if sort == "Bool":
+                declared_bool.add(name)
+                inputs.append(Variable(name, VariableType.BOOLEAN))
+            elif sort == "Int":
+                declared_int.add(name)
+                inputs.append(Variable(name, VariableType.INTEGER))
+            else:
+                raise ValueError(f"Unsupported sort in QF_LIA: {sort!r}")
+            continue
+        if head == "assert":
+            if len(form) != 2:
+                raise ValueError("assert expects a single argument")
+            expr = _expr(form[1])
+            assertions.append(Assertion(identifier=f"assert_{len(assertions)}", value=expr))
+            continue
+
+    return Circuit(
+        name="smtlib2_lia",
+        inputs=inputs,
+        outputs=[],
+        statements=assertions,
+    )
+
+
 def parse_smtlib2(smtlib2: str, solver: str = "z3") -> Circuit:
     """
     Auto-detect SMT-LIB logic and parse into Circuit IR.
@@ -348,4 +532,6 @@ def parse_smtlib2(smtlib2: str, solver: str = "z3") -> Circuit:
         or re.search(r"\bff\.(add|mul|neg|sub)\b", smtlib2)
     ):
         return parse_smtlib2_ff(smtlib2)
+    if re.search(r"\(set-logic\s+QF_LIA\b", smtlib2) or re.search(r"\(\s*declare-fun\s+\S+\s+\(\)\s+Int\b", smtlib2):
+        return parse_smtlib2_lia(smtlib2)
     return parse_smtlib2_core(smtlib2, solver=solver)

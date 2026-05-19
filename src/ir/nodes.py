@@ -117,6 +117,7 @@ class Expression(IRNode):
 class VariableType(StrEnum):
     BOOLEAN = "Boolean"
     FIELD = "Field"
+    INTEGER = "Integer"
 
 
 @dataclass

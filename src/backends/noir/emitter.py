@@ -28,6 +28,8 @@ class EmitVisitor:
                 self.visit_integer_literal(node)
             case StringLiteral():
                 self.visit_string_literal(node)
+            case CastExpression():
+                self.visit_cast_expression(node)
             case TupleLiteral():
                 self.visit_tuple_literal(node)
             case FunctionCall():
@@ -76,6 +78,11 @@ class EmitVisitor:
 
     def visit_string_literal(self, node: StringLiteral):
         self.buffer.write(f"\"{node.value}\"")
+
+    def visit_cast_expression(self, node: CastExpression):
+        self.buffer.write("(")
+        self.visit(node.expr)
+        self.buffer.write(f" as {node.type_})")
 
     def visit_tuple_literal(self, node: TupleLiteral):
         self.buffer.write("(")
