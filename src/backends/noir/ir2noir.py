@@ -56,17 +56,21 @@ def _fold_expr_constant(expr) -> int | None:
 
 
 def _min_signed_type(val: int) -> IntegerType:
-    """Smallest signed IntegerType whose range contains val."""
-    a = abs(val)
-    if a <= 127:       return IntegerType(8,  True)
-    if a <= 32_767:    return IntegerType(16, True)
-    if a <= 2**31 - 1: return IntegerType(32, True)
+    """All integer constants use i64 to avoid out-of-range literal errors."""
     return IntegerType(64, True)
 
 
 def _common_int_type(t1: IntegerType, t2: IntegerType) -> IntegerType:
-    """Promotion: max width, signed if either operand is signed."""
-    return IntegerType(max(t1.bits, t2.bits), t1.signed or t2.signed)
+    """Promotion: max width, signed if either operand is signed.
+    When both have equal width but opposite signedness, promote to the next
+    wider signed type to avoid a lossy unsigned→signed cast (e.g. u16 → i16
+    would overflow values > 32767; use i32 instead)."""
+    bits = max(t1.bits, t2.bits)
+    signed = t1.signed or t2.signed
+    if signed and (t1.signed != t2.signed) and t1.bits == t2.bits:
+        # Same width, mixed signedness: need one extra bit to stay lossless.
+        bits = min(bits * 2, 64)
+    return IntegerType(bits, signed)
 
 
 class NameDispenser:
@@ -92,6 +96,8 @@ class IR2NoirVisitor:
     ):
         self._name_dispenser = NameDispenser()
         self._int_type_map: dict[str, IntegerType] = int_type_map or {}
+        # Cache: emitted-expression-string → Identifier for deduplication of mid_N vars.
+        self._mid_cache: dict[str, Identifier] = {}
         # Populated by visit_circuit: maps original param name → actual Noir param name
         # (may add '_' prefix for unused params).
         self.param_name_map: dict[str, str] = {}
@@ -299,8 +305,9 @@ class IR2NoirVisitor:
                 op_name = "add" if node.op == IRNodes.Operator.ADD else \
                           "mul" if node.op == IRNodes.Operator.MUL else "sub"
                 self.safe_fns_needed.add((op_name, expr_t.bits, expr_t.signed))
-                return FunctionCall(Identifier(f"safe_math::safe_{op_name}_{expr_t}"),
-                                    [lhs, rhs]), statements
+                final_expr: Expression = FunctionCall(
+                    Identifier(f"safe_math::safe_{op_name}_{expr_t}"), [lhs, rhs])
+                return self._maybe_intermediate(node, final_expr, statements)
 
         # Non-safe path: insert casts for type-differing operands.
         common: IntegerType | None = None
@@ -315,9 +322,72 @@ class IR2NoirVisitor:
         elif rt is not None:
             common = rt
 
-        return BinaryExpression(op, lhs, rhs), statements
+        return self._maybe_intermediate(node, BinaryExpression(op, lhs, rhs), statements)
+
+    @staticmethod
+    def _expr_to_str(expr: Expression) -> str:
+        """Emit a Noir AST expression to a string for cache-key comparison."""
+        import io
+        from .emitter import EmitVisitor
+        buf = io.StringIO()
+        ev = EmitVisitor()
+        ev.buffer = buf
+        ev.visit(expr)
+        return buf.getvalue()
+
+    def _maybe_intermediate(
+        self,
+        ir_node: IRNodes.BinaryExpression,
+        noir_expr: Expression,
+        stmts: list[Statement],
+    ) -> tuple[Expression, list[Statement]]:
+        """Randomly extract a sub-expression into a named intermediate let binding.
+        Identical expressions are deduplicated — the same Identifier is reused."""
+        if (self._rng
+                and ir_node.node_size() >= 3
+                and self._rng.random() < 0.3):
+            key = self._expr_to_str(noir_expr)
+            if key in self._mid_cache:
+                return self._mid_cache[key].copy(), stmts  # reuse existing mid_N
+            mid_name = self._name_dispenser.next("mid")
+            mid_type = self._infer_type(ir_node)
+            stmts.append(LetStatement(mid_name.copy(), noir_expr, mid_type))
+            self._mid_cache[key] = mid_name.copy()
+            return mid_name, stmts
+        return noir_expr, stmts
+
+    def _is_abs_pattern(self, node: IRNodes.TernaryExpression) -> IRNodes.Expression | None:
+        """Return the inner expression if node is abs(inner), else None."""
+        cond = node.condition
+        if not (isinstance(cond, IRNodes.BinaryExpression)
+                and cond.op == IRNodes.Operator.GEQ
+                and isinstance(cond.rhs, IRNodes.Integer)
+                and cond.rhs.value == 0):
+            return None
+        inner = cond.lhs
+        if node.if_expr != inner:
+            return None
+        else_expr = node.else_expr
+        if not (isinstance(else_expr, IRNodes.UnaryExpression)
+                and else_expr.op == IRNodes.Operator.SUB
+                and else_expr.value == inner):
+            return None
+        return inner
 
     def visit_ternary_expression(self, node: IRNodes.TernaryExpression) -> tuple[Expression, list[Statement]]:
+        # Detect abs pattern and emit safe_math::safe_abs_T instead of tmp if/else.
+        inner = self._is_abs_pattern(node)
+        if inner is not None:
+            t = self._expr_int_type(inner)
+            # Only use safe_abs for signed types. For unsigned, abs is the identity
+            # and the ternary's natural type is wider/signed (due to -x promotion),
+            # so let normal ternary handling emit the correct casts.
+            if isinstance(t, IntegerType) and t.signed:
+                inner_expr, inner_stmts = self.visit_expression(inner)
+                self.safe_fns_needed.add(("abs", t.bits, t.signed))
+                call = FunctionCall(Identifier(f"safe_math::safe_abs_{t}"), [inner_expr])
+                return call, inner_stmts
+
         statements: list[Statement] = []
         condition, cond_tail = self.visit_expression(node.condition)
         statements += cond_tail
@@ -340,8 +410,12 @@ class IR2NoirVisitor:
         default_value: Expression = BooleanLiteral(False) if isinstance(result_type, BoolType) else IntegerLiteral(0)
         statements.append(LetStatement(result_name.copy(), default_value, result_type, is_mutable=True))
 
+        # Each branch is a new scope — mid_N defined inside must not leak out.
+        self._mid_cache.clear()
         if_expr, if_tail = self.visit_expression(node.if_expr)
+        self._mid_cache.clear()
         else_expr, else_tail = self.visit_expression(node.else_expr)
+        self._mid_cache.clear()
 
         # Cast branches to the common type when they differ.
         if lt is not None and rt is not None and lt != rt:
@@ -364,6 +438,7 @@ class IR2NoirVisitor:
         return result_name, statements
 
     def visit_assertion(self, node: IRNodes.Assertion) -> list[Statement]:
+        self._mid_cache.clear()   # reset per-statement so mid_N never escapes its scope
         expr, stmts = self.visit_expression(node.value)
         stmts.append(AssertStatement(expr, StringLiteral(node.identifier)))
         return stmts
@@ -417,6 +492,7 @@ class IR2NoirVisitor:
         #  - globals extracted inside helpers end up in the Document
         flat_visitor._name_dispenser = self._name_dispenser
         flat_visitor.safe_fns_needed = self.safe_fns_needed
+        # Each visitor has its own _mid_cache — scopes must not cross visitor boundaries.
         # (no global defs to share — global constant extraction removed)
 
         group_helpers: dict[str, tuple] = {}
@@ -441,6 +517,7 @@ class IR2NoirVisitor:
             if len(group) == 1:
                 # Solo: returns bool.
                 stmt = group[0]
+                flat_visitor._mid_cache.clear()
                 helper_expr, helper_pre = flat_visitor.visit_expression(stmt.value)
                 helper_fns.append(FunctionDefinition(
                     name=Identifier(helper_name),
@@ -454,6 +531,7 @@ class IR2NoirVisitor:
                 # Multi: void, multiple assert statements inside.
                 body_stmts: list[Statement] = []
                 for stmt in group:
+                    flat_visitor._mid_cache.clear()
                     helper_expr, helper_pre = flat_visitor.visit_expression(stmt.value)
                     body_stmts += helper_pre
                     body_stmts.append(AssertStatement(helper_expr, StringLiteral(stmt.identifier)))
@@ -669,6 +747,7 @@ class IR2NoirVisitor:
         #  - globals extracted inside helpers end up in the Document
         flat_visitor._name_dispenser = self._name_dispenser
         flat_visitor.safe_fns_needed = self.safe_fns_needed
+        # Each visitor has its own _mid_cache — scopes must not cross visitor boundaries.
         # (no global defs to share — global constant extraction removed)
 
         # First pass: build each helper independently.
@@ -690,6 +769,7 @@ class IR2NoirVisitor:
 
             if len(group) == 1:
                 stmt = group[0]
+                flat_visitor._mid_cache.clear()
                 helper_expr, helper_pre = flat_visitor.visit_expression(stmt.value)
                 fn = FunctionDefinition(
                     name=Identifier(helper_name),
@@ -702,6 +782,7 @@ class IR2NoirVisitor:
             else:
                 body_stmts: list[Statement] = []
                 for stmt in group:
+                    flat_visitor._mid_cache.clear()
                     helper_expr, helper_pre = flat_visitor.visit_expression(stmt.value)
                     body_stmts += helper_pre
                     body_stmts.append(AssertStatement(helper_expr, StringLiteral(stmt.identifier)))

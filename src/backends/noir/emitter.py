@@ -92,9 +92,14 @@ class EmitVisitor:
         self.buffer.write(f"\"{node.value}\"")
 
     def visit_cast_expression(self, node: CastExpression):
-        self.buffer.write("(")
-        self.visit(node.expr)
-        self.buffer.write(f" as {node.type_})")
+        # (-N as iX) is parsed by Noir as (field_elem(p-N) as iX) → wrong value.
+        # Use the suffixed literal form -N_iX instead.
+        if isinstance(node.expr, IntegerLiteral) and node.expr.value < 0:
+            self.buffer.write(f"({node.expr.value}_{node.type_})")
+        else:
+            self.buffer.write("(")
+            self.visit(node.expr)
+            self.buffer.write(f" as {node.type_})")
 
     def visit_tuple_literal(self, node: TupleLiteral):
         self.buffer.write("(")

@@ -174,11 +174,16 @@ def smt_expr_int_type(expr, int_type_map: dict):
             return lt
         return _common_int_type(lt, rt)
     if isinstance(expr, IRBin) and expr.op in (IROp.ADD, IROp.SUB, IROp.MUL):
+        # Constant-fold first, matching how _expr_int_type works in ir2noir.py.
+        # Without this, 82+99 gets typed as i8 (from operand types) rather than
+        # i16 (from the folded result 181), causing spuriously tight bounds in Z3.
+        val = _fold_expr_constant(expr)
+        if val is not None:
+            return _min_signed_type(val)
         lt = smt_expr_int_type(expr.lhs, int_type_map)
         rt = smt_expr_int_type(expr.rhs, int_type_map)
         if lt is None and rt is None:
-            val = _fold_expr_constant(expr)
-            return _min_signed_type(val) if val is not None else None
+            return None
         if lt is None:
             return rt
         if rt is None:
@@ -394,23 +399,40 @@ def _blocking_clause(model: dict[str, tuple[str, str]], declared: set[str]) -> s
 
 
 def build_safe_math_source(fns_needed: set[tuple[str, int, bool]]) -> str:
-    """Generate safe_math.nr source with safe_add_T and safe_mul_T for each needed type."""
+    """Generate safe_math.nr source for safe_add/sub/mul/abs per type."""
     lines: list[str] = []
     for op_name, bits, signed in sorted(fns_needed):
         type_str = f"{'i' if signed else 'u'}{bits}"
         fn_name = f"safe_{op_name}_{type_str}"
-        noir_op = {"add": "+", "sub": "-", "mul": "*"}[op_name]
-        lo = -(2 ** (bits - 1)) if signed else 0
-        hi = (2 ** (bits - 1) - 1) if signed else (2 ** min(bits, 63)) - 1
-        lines += [
-            f"pub fn {fn_name}(a: {type_str}, b: {type_str}) -> {type_str} {{",
-            f"    let c: {type_str} = a {noir_op} b;",
-            f"    assert(c >= {lo}, \"{fn_name}_lb\");",
-            f"    assert(c <= {hi}, \"{fn_name}_ub\");",
-            f"    c",
-            f"}}",
-            "",
-        ]
+        if op_name == "abs":
+            if not signed:
+                # Unsigned values are always non-negative; abs is the identity.
+                lines += [
+                    f"pub fn {fn_name}(a: {type_str}) -> {type_str} {{",
+                    f"    a",
+                    f"}}",
+                    "",
+                ]
+            else:
+                lines += [
+                    f"pub fn {fn_name}(a: {type_str}) -> {type_str} {{",
+                    f"    if a >= 0 {{ a }} else {{ -a }}",
+                    f"}}",
+                    "",
+                ]
+        else:
+            noir_op = {"add": "+", "sub": "-", "mul": "*"}[op_name]
+            lo = -(2 ** (bits - 1)) if signed else 0
+            hi = (2 ** (bits - 1) - 1) if signed else (2 ** min(bits, 63)) - 1
+            lines += [
+                f"pub fn {fn_name}(a: {type_str}, b: {type_str}) -> {type_str} {{",
+                f"    let c: {type_str} = a {noir_op} b;",
+                f"    assert(c >= {lo}, \"{fn_name}_lb\");",
+                f"    assert(c <= {hi}, \"{fn_name}_ub\");",
+                f"    c",
+                f"}}",
+                "",
+            ]
     return "\n".join(lines)
 
 
@@ -662,6 +684,7 @@ def create_noir_project(
     smt_source: str = "",
     smt_filename: str = "",
     safe_math_source: str = "",
+    z3_query: str = "",
 ) -> None:
     project_dir.mkdir(parents=True, exist_ok=True)
     src_dir = project_dir / "src"
@@ -675,6 +698,8 @@ def create_noir_project(
     )
     if smt_source and smt_filename:
         (project_dir / smt_filename).write_text(smt_source)
+    if z3_query:
+        (project_dir / "z3_query.smt2").write_text(z3_query)
 
 
 def save_error(
@@ -687,10 +712,13 @@ def save_error(
     smt_content: str,
     smt_filename: str,
     nargo_output: str,
+    safe_math_source: str = "",
+    z3_query: str = "",
 ) -> None:
     dest = errors_dir / category / folder_name
     create_noir_project(dest, noir_source, prover_toml, package_name,
-                        smt_source=smt_content, smt_filename=smt_filename)
+                        smt_source=smt_content, smt_filename=smt_filename,
+                        safe_math_source=safe_math_source, z3_query=z3_query)
     (dest / "nargo_output.txt").write_text(nargo_output)
 
 
@@ -995,8 +1023,8 @@ def _is_unsat_with_fix(
     int_type_map: dict[str, IntegerType],
     safe_arith_bounds: list[str] | None = None,
     timeout: int = 10,
-) -> bool:
-    """Return True if the formula is UNSAT when var_name is forced to fixed_value."""
+) -> tuple[bool, str]:
+    """Return (is_unsat, z3_query) — query saved for reproduction if oracle fires."""
     base = _strip_check_commands(smt_content)
     bounds = _bounds_clauses(int_vars, int_type_map)
     fix = f"(assert (= {var_name} {fixed_value}))"
@@ -1006,7 +1034,7 @@ def _is_unsat_with_fix(
         ["z3", "-in"], input=query,
         capture_output=True, text=True, timeout=timeout,
     )
-    return proc.stdout.strip().startswith("unsat")
+    return proc.stdout.strip().startswith("unsat"), query
 
 
 _INT_FLIP_DELTAS = [1, -1]
@@ -1019,14 +1047,10 @@ def find_sat_oracle_input(
     int_vars: set[str],
     int_type_map: dict[str, IntegerType],
     safe_arith_bounds: list[str] | None = None,
-) -> dict | None:
+) -> tuple[dict, str] | None:
     """
     Try minimal single-variable modifications that Z3 confirms make the formula UNSAT.
-
-    1. Flip each boolean (only one other value).
-    2. Add/subtract small deltas to each integer (within the variable's type bounds).
-
-    Returns the first modified model found, or None.
+    Returns (modified_model, z3_query) or None.
     """
     # --- Boolean flips ---
     for var in circuit.inputs:
@@ -1035,9 +1059,10 @@ def find_sat_oracle_input(
         current = model.get(var.name, ('Bool', 'false'))[1]
         flipped = 'false' if current == 'true' else 'true'
         try:
-            if _is_unsat_with_fix(smt_content, var.name, flipped,
-                                  int_vars, int_type_map, safe_arith_bounds):
-                return {**model, var.name: ('Bool', flipped)}
+            is_unsat, query = _is_unsat_with_fix(smt_content, var.name, flipped,
+                                                  int_vars, int_type_map, safe_arith_bounds)
+            if is_unsat:
+                return {**model, var.name: ('Bool', flipped)}, query
         except subprocess.TimeoutExpired:
             continue
 
@@ -1057,9 +1082,10 @@ def find_sat_oracle_input(
             if not (lo <= new_val <= hi):
                 continue
             try:
-                if _is_unsat_with_fix(smt_content, var.name, str(new_val),
-                                      int_vars, int_type_map, safe_arith_bounds):
-                    return {**model, var.name: ('Int', str(new_val))}
+                is_unsat, query = _is_unsat_with_fix(smt_content, var.name, str(new_val),
+                                                      int_vars, int_type_map, safe_arith_bounds)
+                if is_unsat:
+                    return {**model, var.name: ('Int', str(new_val))}, query
             except subprocess.TimeoutExpired:
                 continue
 
@@ -1305,6 +1331,16 @@ def main() -> None:
             )
             continue
 
+        # Build the Z3 query for SAT model enumeration (saved alongside any SAT errors
+        # so they can be reproduced independently outside the fuzzer).
+        _z3_sat_query = (
+            _strip_check_commands(smt_content)
+            + "\n"
+            + "\n".join(_bounds_clauses(int_vars, int_type_map, mul_factors)
+                         + (safe_arith_bounds or []))
+            + "\n(check-sat)\n(get-model)\n"
+        )
+
         # 3. Enumerate satisfying models with the configured solver
         _enum_kwargs = dict(
             timeout=args.z3_timeout,
@@ -1366,6 +1402,15 @@ def main() -> None:
             # UNSAT oracle: run N boundary-value samples — all must be rejected.
             seed = int(hashlib.md5(smt_content.encode()).hexdigest(), 16) + 1
             rng_unsat = random.Random(seed)
+            # Build the exact Z3 query that declared this formula UNSAT so it can
+            # be reproduced independently (saved alongside any oracle violations).
+            _z3_unsat_query = (
+                _strip_check_commands(smt_content)
+                + "\n"
+                + "\n".join(_bounds_clauses(int_vars, int_type_map, mul_factors)
+                             + (safe_arith_bounds or []))
+                + "\n(check-sat)\n(get-model)\n"
+            )
             for idx in range(args.max_witnesses):
                 folder_name = f"obj.{stem}-{idx}"
                 pkg_name    = _sanitize_name(folder_name)
@@ -1373,7 +1418,7 @@ def main() -> None:
                 boundary_toml = build_boundary_prover_toml(circuit, int_type_map, rng_unsat, mul_factors, struct_map, array_map, tuple_map, nesting_map, param_name_map)
                 create_noir_project(project_dir, noir_source, boundary_toml, pkg_name,
                                     smt_source=smt_content, smt_filename=smt_filename,
-                                    safe_math_source=safe_math_src)
+                                    safe_math_source=safe_math_src, z3_query=_z3_unsat_query)
                 print(f"  [{folder_name}] unsat boundary  ... ", end="", flush=True)
                 timed_out = False
                 try:
@@ -1385,10 +1430,12 @@ def main() -> None:
                 if u_ok:
                     print("BUG")
                     unsat_error += 1
+                    dest_path = errors_dir / "error" / (folder_name + "_unsat_oracle")
                     save_error(errors_dir, "error", folder_name + "_unsat_oracle",
                                noir_source, boundary_toml, pkg_name,
                                smt_content, smt_filename,
-                               "UNSAT ORACLE VIOLATION: nargo accepted boundary input\n" + u_out)
+                               "UNSAT ORACLE VIOLATION: nargo accepted boundary input\n" + u_out,
+                               safe_math_src, _z3_unsat_query)
                 elif timed_out:
                     print("TIMEOUT")
                     n_timeout += 1
@@ -1401,7 +1448,8 @@ def main() -> None:
                     save_error(errors_dir, "unsat_pipeline", folder_name,
                                noir_source, boundary_toml, pkg_name,
                                smt_content, smt_filename,
-                               "UNSAT PIPELINE ERROR: nargo failed but not via assertion\n" + u_out)
+                               "UNSAT PIPELINE ERROR: nargo failed but not via assertion\n" + u_out,
+                               safe_math_src, _z3_unsat_query)
             continue
 
         print(f"  {len(models)} satisfying model(s) found")
@@ -1416,7 +1464,7 @@ def main() -> None:
             create_noir_project(
                 project_dir, noir_source, prover_toml, pkg_name,
                 smt_source=smt_content, smt_filename=smt_filename,
-                safe_math_source=safe_math_src,
+                safe_math_source=safe_math_src, z3_query=_z3_sat_query,
             )
 
             print(f"  [{folder_name}] nargo execute   ... ", end="", flush=True)
@@ -1436,14 +1484,15 @@ def main() -> None:
                 sat_ok += 1
 
                 # SAT oracle: find a minimal UNSAT modification and assert nargo rejects it.
-                oracle_model = find_sat_oracle_input(
+                oracle_result = find_sat_oracle_input(
                     smt_content, circuit, model, int_vars, int_type_map, safe_arith_bounds)
-                if oracle_model is not None:
+                if oracle_result is not None:
+                    oracle_model, oracle_z3_query = oracle_result
                     oracle_toml = model_to_prover_toml(oracle_model, circuit, struct_map, array_map, tuple_map, nesting_map, param_name_map)
                     oracle_dir = sat_to_unsat_dir / folder_name
                     create_noir_project(oracle_dir, noir_source, oracle_toml, pkg_name,
                                         smt_source=smt_content, smt_filename=smt_filename,
-                                        safe_math_source=safe_math_src)
+                                        safe_math_source=safe_math_src, z3_query=oracle_z3_query)
                     print(f"  [{folder_name}] sat oracle      ... ", end="", flush=True)
                     try:
                         o_ok, o_out = run_nargo_execute(oracle_dir, timeout=args.nargo_timeout)
@@ -1455,7 +1504,8 @@ def main() -> None:
                         save_error(errors_dir, "error", folder_name + "_sat_oracle",
                                    noir_source, oracle_toml, pkg_name,
                                    smt_content, smt_filename,
-                                   "SAT ORACLE VIOLATION: nargo accepted a Z3-UNSAT input\n" + o_out)
+                                   "SAT ORACLE VIOLATION: nargo accepted a Z3-UNSAT input\n" + o_out,
+                                   safe_math_src, oracle_z3_query)
                     elif _is_assertion_failure(o_out):
                         print("ok (correctly rejected)")
                         oracle_ok += 1
@@ -1465,7 +1515,8 @@ def main() -> None:
                         save_error(errors_dir, "sat_to_unsat_pipeline", folder_name,
                                    noir_source, oracle_toml, pkg_name,
                                    smt_content, smt_filename,
-                                   "SAT_TO_UNSAT PIPELINE ERROR: nargo failed but not via assertion\n" + o_out)
+                                   "SAT_TO_UNSAT PIPELINE ERROR: nargo failed but not via assertion\n" + o_out,
+                                   safe_math_src, oracle_z3_query)
                 else:
                     print(f"  [{folder_name}] sat oracle      ... skipped (no UNSAT mutation found)")
                     oracle_skip += 1
@@ -1475,7 +1526,8 @@ def main() -> None:
                 n_timeout += 1
                 save_error(errors_dir, "timeout", folder_name,
                            noir_source, prover_toml, pkg_name,
-                           smt_content, smt_filename, "")
+                           smt_content, smt_filename, "",
+                           safe_math_src, _z3_sat_query)
             else:
                 is_overflow = "overflow" in output.lower()
                 category = "overflow" if is_overflow else "error"
@@ -1491,7 +1543,8 @@ def main() -> None:
                     sat_error += 1
                 save_error(errors_dir, category, folder_name,
                            noir_source, prover_toml, pkg_name,
-                           smt_content, smt_filename, output)
+                           smt_content, smt_filename, output,
+                           safe_math_src, _z3_sat_query)
 
     total_bugs = sat_error + unsat_error + oracle_bug
     print(f"\n{'='*60}")
