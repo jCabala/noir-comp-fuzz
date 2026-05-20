@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from dataclasses import field
 
 from .operators import Operator
-from .types import NoirType, IntegerType
+from .types import NoirType, IntegerType, StructType, AliasType
 
 
 @dataclass
@@ -115,6 +115,7 @@ class LetStatement(Statement):
     expr: Expression
     type_: NoirType | None = None
     is_mutable: bool = False
+    is_comptime: bool = False
 
     def copy(self) -> "LetStatement":
         return LetStatement(
@@ -122,6 +123,7 @@ class LetStatement(Statement):
             self.expr.copy(),
             self.type_.copy() if self.type_ else None,
             self.is_mutable,
+            self.is_comptime,
         )
 
 
@@ -197,14 +199,77 @@ class FunctionDefinition(ASTNode):
 
 
 @dataclass
+class TypeAliasDefinition(ASTNode):
+    alias: str
+    target: NoirType
+
+    def copy(self) -> "TypeAliasDefinition":
+        return TypeAliasDefinition(self.alias, self.target.copy())
+
+
+@dataclass
+class GlobalDefinition(ASTNode):
+    name: str
+    type_: NoirType
+    value: Expression
+
+    def copy(self) -> "GlobalDefinition":
+        return GlobalDefinition(self.name, self.type_.copy(), self.value.copy())
+
+
+@dataclass
+class TupleFieldAccess(Expression):
+    obj: Expression
+    index: int
+
+    def copy(self) -> "TupleFieldAccess":
+        return TupleFieldAccess(self.obj.copy(), self.index)
+
+
+@dataclass
+class StructDefinition(ASTNode):
+    name: str
+    fields: list[VariableDefinition]
+
+    def copy(self) -> "StructDefinition":
+        return StructDefinition(self.name, [f.copy() for f in self.fields])
+
+
+@dataclass
+class FieldAccess(Expression):
+    obj: Expression
+    field: str
+
+    def copy(self) -> "FieldAccess":
+        return FieldAccess(self.obj.copy(), self.field)
+
+
+@dataclass
+class ArrayIndexExpression(Expression):
+    array: Expression
+    index: int
+
+    def copy(self) -> "ArrayIndexExpression":
+        return ArrayIndexExpression(self.array.copy(), self.index)
+
+
+@dataclass
 class Document(ASTNode):
     main: FunctionDefinition
+    type_alias_defs: list[TypeAliasDefinition] = field(default_factory=list)
+    global_defs: list[GlobalDefinition] = field(default_factory=list)
+    struct_definitions: list[StructDefinition] = field(default_factory=list)
     helper_functions: list[FunctionDefinition] = field(default_factory=list)
     imports: list[str] = field(default_factory=list)
+    submodules: list[str] = field(default_factory=list)
 
     def copy(self) -> "Document":
         return Document(
             self.main.copy(),
+            [t.copy() for t in self.type_alias_defs],
+            [g.copy() for g in self.global_defs],
+            [s.copy() for s in self.struct_definitions],
             [helper.copy() for helper in self.helper_functions],
             [i for i in self.imports],
+            [s for s in self.submodules],
         )

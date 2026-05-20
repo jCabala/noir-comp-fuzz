@@ -2,5 +2,5 @@
   "strategy": "noinc",
   "logic": ["QF_LIA"],
   "seed": null,
-  "cntsize": 5
+  "cntsize": 30
 }

@@ -50,6 +50,18 @@ class EmitVisitor:
                 self.visit_variable_definition(node)
             case FunctionDefinition():
                 self.visit_function_definition(node)
+            case TypeAliasDefinition():
+                self.visit_type_alias_definition(node)
+            case GlobalDefinition():
+                self.visit_global_definition(node)
+            case TupleFieldAccess():
+                self.visit_tuple_field_access(node)
+            case StructDefinition():
+                self.visit_struct_definition(node)
+            case FieldAccess():
+                self.visit_field_access(node)
+            case ArrayIndexExpression():
+                self.visit_array_index_expression(node)
             case Document():
                 self.visit_document(node)
             case _:
@@ -108,9 +120,12 @@ class EmitVisitor:
             self.buffer.write(";")
 
     def visit_let_statement(self, node: LetStatement):
-        self.buffer.write(self.current_indent + "let ")
-        if node.is_mutable:
-            self.buffer.write("mut ")
+        if node.is_comptime:
+            self.buffer.write(self.current_indent + "comptime let ")
+        else:
+            self.buffer.write(self.current_indent + "let ")
+            if node.is_mutable:
+                self.buffer.write("mut ")
         self.visit(node.name)
         if node.type_:
             self.buffer.write(f" : {node.type_}")
@@ -177,11 +192,56 @@ class EmitVisitor:
             self.buffer.write(" ")
         self.visit(node.body)
 
+    def visit_type_alias_definition(self, node: TypeAliasDefinition):
+        self.buffer.write(f"type {node.alias} = {node.target};")
+
+    def visit_global_definition(self, node: GlobalDefinition):
+        self.buffer.write(f"global {node.name}: {node.type_} = ")
+        self.visit(node.value)
+        self.buffer.write(";")
+
+    def visit_tuple_field_access(self, node: TupleFieldAccess):
+        self.visit(node.obj)
+        self.buffer.write(f".{node.index}")
+
+    def visit_struct_definition(self, node: StructDefinition):
+        self.buffer.write(f"pub struct {node.name} {{\n")
+        for field_def in node.fields:
+            self.buffer.write(f"    ")
+            self.visit(field_def)
+            self.buffer.write(",\n")
+        self.buffer.write("}")
+
+    def visit_field_access(self, node: FieldAccess):
+        self.visit(node.obj)
+        self.buffer.write(f".{node.field}")
+
+    def visit_array_index_expression(self, node: ArrayIndexExpression):
+        self.visit(node.array)
+        self.buffer.write(f"[{node.index}]")
+
     def visit_document(self, node: Document):
+        for mod in node.submodules:
+            self.buffer.write(f"mod {mod};\n")
+        if node.submodules:
+            self.buffer.write("\n")
         for idx, imp in enumerate(node.imports):
             self.buffer.write(f"use {imp};\n")
             if idx + 1 == len(node.imports):
                 self.buffer.write("\n")
+        for alias_def in node.type_alias_defs:
+            self.visit(alias_def)
+            self.buffer.write("\n")
+        if node.type_alias_defs:
+            self.buffer.write("\n")
+        for global_def in node.global_defs:
+            self.visit(global_def)
+            self.buffer.write("\n")
+        if node.global_defs:
+            self.buffer.write("\n")
+        for struct_def in node.struct_definitions:
+            self.visit(struct_def)
+            self.buffer.write("\n\n")
         for helper in node.helper_functions:
             self.visit(helper)
             self.buffer.write("\n\n")

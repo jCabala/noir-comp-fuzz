@@ -113,6 +113,117 @@ def _effective_mul_factor(expr, var_name: str) -> int | None:
     return None
 
 
+def ir_expr_to_smt(expr) -> str | None:
+    """Convert an IR expression to its SMT-LIB2 string, or None if not convertible."""
+    from src.ir.nodes import Integer as IRInt, Variable as IRVar, BinaryExpression as IRBin, \
+        UnaryExpression as IRUnary, TernaryExpression as IRTernary, Operator as IROp, VariableType
+    if isinstance(expr, IRInt):
+        return f"(- {abs(expr.value)})" if expr.value < 0 else str(expr.value)
+    if isinstance(expr, IRVar):
+        return expr.name if expr.variable_type == VariableType.INTEGER else None
+    if isinstance(expr, IRUnary) and expr.op == IROp.SUB:
+        inner = ir_expr_to_smt(expr.value)
+        return f"(- {inner})" if inner is not None else None
+    if isinstance(expr, IRBin):
+        # Comparison operators for ternary conditions
+        cmp_ops = {IROp.EQU: '=', IROp.NEQ: None, IROp.LTH: '<',
+                   IROp.LEQ: '<=', IROp.GTH: '>', IROp.GEQ: '>='}
+        arith_ops = {IROp.ADD: '+', IROp.SUB: '-', IROp.MUL: '*'}
+        smt_op = arith_ops.get(expr.op) or cmp_ops.get(expr.op)
+        if smt_op is None:
+            return None
+        l = ir_expr_to_smt(expr.lhs)
+        r = ir_expr_to_smt(expr.rhs)
+        return f"({smt_op} {l} {r})" if l is not None and r is not None else None
+    if isinstance(expr, IRTernary):
+        cond = ir_expr_to_smt(expr.condition)
+        if_s = ir_expr_to_smt(expr.if_expr)
+        else_s = ir_expr_to_smt(expr.else_expr)
+        if cond is not None and if_s is not None and else_s is not None:
+            return f"(ite {cond} {if_s} {else_s})"
+    return None
+
+
+def smt_expr_int_type(expr, int_type_map: dict):
+    """Standalone type inference for IR expressions — mirrors ir2noir._expr_int_type."""
+    from src.ir.nodes import Integer as IRInt, Variable as IRVar, BinaryExpression as IRBin, \
+        UnaryExpression as IRUnary, TernaryExpression as IRTernary, Operator as IROp, VariableType
+    from src.backends.noir.ir2noir import _common_int_type, _min_signed_type, \
+        _UNSIGNED_NEG_PROMOTION, _fold_expr_constant
+    from src.backends.noir.types import IntegerType
+    if isinstance(expr, IRVar) and expr.variable_type == VariableType.INTEGER:
+        return int_type_map.get(expr.name, IntegerType(64, True))
+    if isinstance(expr, IRInt):
+        return _min_signed_type(expr.value)  # every integer literal has a concrete type
+    if isinstance(expr, IRUnary) and expr.op == IROp.SUB:
+        t = smt_expr_int_type(expr.value, int_type_map)
+        if t is None:
+            return None
+        if not t.signed:
+            return IntegerType(_UNSIGNED_NEG_PROMOTION.get(t.bits, 64), True)
+        return t
+    if isinstance(expr, IRTernary):
+        # Use the common (widest) type across both branches.
+        lt = smt_expr_int_type(expr.if_expr, int_type_map)
+        rt = smt_expr_int_type(expr.else_expr, int_type_map)
+        if lt is None and rt is None:
+            return None
+        if lt is None:
+            return rt
+        if rt is None:
+            return lt
+        return _common_int_type(lt, rt)
+    if isinstance(expr, IRBin) and expr.op in (IROp.ADD, IROp.SUB, IROp.MUL):
+        lt = smt_expr_int_type(expr.lhs, int_type_map)
+        rt = smt_expr_int_type(expr.rhs, int_type_map)
+        if lt is None and rt is None:
+            val = _fold_expr_constant(expr)
+            return _min_signed_type(val) if val is not None else None
+        if lt is None:
+            return rt
+        if rt is None:
+            return lt
+        return _common_int_type(lt, rt)
+    return None
+
+
+def collect_safe_arith_bounds(circuit, int_type_map: dict) -> list[str]:
+    """
+    Walk all assertions and for every ADD/SUB/MUL sub-expression with a known
+    integer type, emit Z3 bounds clauses that mirror the safe_math assertions.
+    """
+    from src.ir.nodes import (
+        BinaryExpression as IRBin, UnaryExpression as IRUnary,
+        TernaryExpression as IRTernary, Assertion, Operator as IROp,
+    )
+    SAFE_OPS = (IROp.ADD, IROp.SUB, IROp.MUL)
+    clauses: list[str] = []
+    seen: set[str] = set()
+
+    def _walk(node) -> None:
+        if isinstance(node, IRBin):
+            if node.op in SAFE_OPS:
+                smt_str = ir_expr_to_smt(node)
+                t = smt_expr_int_type(node, int_type_map)
+                if smt_str is not None and t is not None and smt_str not in seen:
+                    seen.add(smt_str)
+                    lo, hi = _type_bounds(t)
+                    clauses.append(f"(assert (>= {smt_str} {lo}))")
+                    clauses.append(f"(assert (<= {smt_str} {hi}))")
+            _walk(node.lhs)
+            _walk(node.rhs)
+        elif isinstance(node, IRUnary):
+            _walk(node.value)
+        elif isinstance(node, IRTernary):
+            _walk(node.condition); _walk(node.if_expr); _walk(node.else_expr)
+        elif isinstance(node, Assertion):
+            _walk(node.value)
+
+    for stmt in circuit.statements:
+        _walk(stmt)
+    return clauses
+
+
 def _collect_mul_factors(circuit: Circuit) -> dict[str, int]:
     """
     Walk all assertions and return, for each INTEGER variable, the maximum
@@ -282,16 +393,33 @@ def _blocking_clause(model: dict[str, tuple[str, str]], declared: set[str]) -> s
     return f"(assert (not {body}))"
 
 
+def build_safe_math_source(fns_needed: set[tuple[str, int, bool]]) -> str:
+    """Generate safe_math.nr source with safe_add_T and safe_mul_T for each needed type."""
+    lines: list[str] = []
+    for op_name, bits, signed in sorted(fns_needed):
+        type_str = f"{'i' if signed else 'u'}{bits}"
+        fn_name = f"safe_{op_name}_{type_str}"
+        noir_op = {"add": "+", "sub": "-", "mul": "*"}[op_name]
+        lo = -(2 ** (bits - 1)) if signed else 0
+        hi = (2 ** (bits - 1) - 1) if signed else (2 ** min(bits, 63)) - 1
+        lines += [
+            f"pub fn {fn_name}(a: {type_str}, b: {type_str}) -> {type_str} {{",
+            f"    let c: {type_str} = a {noir_op} b;",
+            f"    assert(c >= {lo}, \"{fn_name}_lb\");",
+            f"    assert(c <= {hi}, \"{fn_name}_ub\");",
+            f"    c",
+            f"}}",
+            "",
+        ]
+    return "\n".join(lines)
+
+
 def _bounds_clauses(
     int_vars: set[str],
     type_map: dict[str, IntegerType],
     mul_factors: dict[str, int] | None = None,
 ) -> list[str]:
-    """
-    Return (assert ...) clauses bounding each integer variable.
-    When a multiplication factor K > 1 is known for a variable, the bound is
-    clamped to ±type.max//K so that v * K never overflows the assigned type.
-    """
+    """Return (assert ...) clauses bounding each integer variable (type range + mul-factor)."""
     factors = mul_factors or {}
     clauses = []
     for v in sorted(int_vars):
@@ -300,10 +428,16 @@ def _bounds_clauses(
         k = factors.get(v, 1)
         if k > 1:
             safe = hi // k
-            lo, hi = -safe, safe
+            lo, hi = max(lo, -safe), safe
         clauses.append(f"(assert (>= {v} {lo}))")
         clauses.append(f"(assert (<= {v} {hi}))")
     return clauses
+
+
+def _solver_cmd(solver: str) -> list[str]:
+    if solver == "cvc5":
+        return ["cvc5", "--produce-models", "--lang=smt2", "-"]
+    return ["z3", "-in"]
 
 
 def enumerate_models(
@@ -314,28 +448,41 @@ def enumerate_models(
     int_vars: set[str] | None = None,
     int_type_map: dict[str, IntegerType] | None = None,
     mul_factors: dict[str, int] | None = None,
+    safe_arith_bounds: list[str] | None = None,
+    solver: str = "z3",
 ) -> list[dict[str, tuple[str, str]]]:
     """
-    Call Z3 repeatedly with blocking clauses to collect up to max_models
-    satisfying assignments.
-
-    Bounds for each integer variable are derived from its assigned Noir type
-    and clamped by the effective multiplication factor to prevent overflow.
+    Call the SMT solver repeatedly with blocking clauses to collect up to max_models
+    satisfying assignments (type range + mul-factor + safe-arithmetic bounds).
     """
     base = _strip_check_commands(smt_content)
     bounds = _bounds_clauses(int_vars or set(), int_type_map or {}, mul_factors)
-    extra: list[str] = bounds[:]
+    extra: list[str] = bounds[:] + (safe_arith_bounds or [])
     models: list[dict[str, tuple[str, str]]] = []
 
     for _ in range(max_models):
         query = base + "\n" + "\n".join(extra) + "\n(check-sat)\n(get-model)\n"
         proc = subprocess.run(
-            ["z3", "-in"],
+            _solver_cmd(solver),
             input=query,
             capture_output=True,
             text=True,
             timeout=timeout,
         )
+        # Raise on unexpected solver errors so they get saved to the errors directory.
+        # "model is not available" is expected when the solver proves UNSAT — not a real error.
+        _EXPECTED_SOLVER_ERRORS = (
+            "model is not available",          # Z3: UNSAT then get-model
+            "cannot get model unless after",   # cvc5: UNSAT then get-model
+        )
+        solver_errors = [
+            l for l in proc.stdout.splitlines()
+            if l.strip().startswith("(error")
+            and not any(e in l for e in _EXPECTED_SOLVER_ERRORS)
+        ]
+        if solver_errors:
+            raise RuntimeError(f"{solver} error: {solver_errors[0].strip()}")
+
         model = _parse_z3_model(proc.stdout)
         if model is None:
             break
@@ -352,34 +499,147 @@ def enumerate_models(
 # Prover.toml generation
 # ---------------------------------------------------------------------------
 
+def _var_toml_value(var, model: dict[str, tuple[str, str]] | None, boundary_val: str | None = None) -> str:
+    """Return the TOML value string for a single variable."""
+    name = var.name
+    if var.variable_type == VariableType.BOOLEAN:
+        if model and name in model:
+            return model[name][1]
+        return boundary_val or "false"
+    else:
+        if model and name in model:
+            raw = model[name][1]
+            if raw.startswith("ff"):
+                raw = raw[2:]
+            return f'"{raw}"'
+        return f'"{boundary_val}"' if boundary_val else '"0"'
+
+
 def model_to_prover_toml(
     model: dict[str, tuple[str, str]],
     circuit,
+    struct_map: dict[str, tuple[str, str]] | None = None,
+    array_map: dict[str, tuple[str, int]] | None = None,
+    tuple_map: dict[str, tuple[str, int]] | None = None,
+    nesting_map: dict[str, tuple[str, str | int]] | None = None,
+    param_name_map: dict[str, str] | None = None,
 ) -> str:
-    """
-    Convert a Z3 model to Noir's Prover.toml format.
-    Boolean vars → TOML booleans; Field vars → quoted decimal strings.
-    Variables missing from the model get a zero/false default.
-    """
-    lines: list[str] = []
+    """Convert a Z3 model to Noir's Prover.toml, respecting struct/array/tuple groupings."""
+    sm = struct_map or {}
+    am = array_map or {}
+    tm = tuple_map or {}
+    nm = nesting_map or {}
+    pnm = param_name_map or {}  # original param → Noir param (may have _ prefix)
+
+    def _pname(p: str) -> str:
+        return pnm.get(p, p)
+
+    array_contents: dict[str, list] = {}
+    for var in circuit.inputs:
+        if var.name in am:
+            param, idx = am[var.name]
+            array_contents.setdefault(param, []).append((idx, var))
+
+    tuple_contents: dict[str, list] = {}
+    for var in circuit.inputs:
+        if var.name in tm:
+            param, idx = tm[var.name]
+            tuple_contents.setdefault(param, []).append((idx, var))
+
+    # Params that are containers (not leaves) — must NOT be emitted in the flat loop.
+    container_params: set[str] = {cont for _, (cont, _) in nm.items()}
+
+    # Helper: render a leaf group as a TOML value string (for nesting into tuples).
+    def _leaf_toml_value(leaf: str) -> str:
+        if leaf in array_contents:
+            members = sorted(array_contents[leaf], key=lambda x: x[0])
+            return "[" + ", ".join(_var_toml_value(v, model) for _, v in members) + "]"
+        if leaf in tuple_contents:
+            members = sorted(tuple_contents[leaf], key=lambda x: x[0])
+            return "[" + ", ".join(_var_toml_value(v, model) for _, v in members) + "]"
+        # Struct rendered as TOML inline table.
+        fields = [(f, v) for v in circuit.inputs
+                  if v.name in sm and sm[v.name][0] == leaf
+                  for _, f in [sm[v.name]]]
+        if fields:
+            inner = ", ".join(f"{f} = {_var_toml_value(v, model)}" for f, v in fields)
+            return "{" + inner + "}"
+        return '""'
+
+    flat_lines: list[str] = []
+    struct_lines: list[str] = []
+    emitted: set[str] = set()
+
+    # Emit flat/array/tuple top-level params (only those NOT nested inside something else).
     for var in circuit.inputs:
         name = var.name
-        if var.variable_type == VariableType.BOOLEAN:
-            if name in model:
-                _, raw = model[name]
-                lines.append(f"{name} = {raw}")      # true / false
-            else:
-                lines.append(f"{name} = false")
-        else:
-            if name in model:
-                _, raw = model[name]
-                # Strip 'ff' prefix that CVC5/Z3-FF uses for field constants.
-                if raw.startswith("ff"):
-                    raw = raw[2:]
-                lines.append(f'{name} = "{raw}"')
-            else:
-                lines.append(f'{name} = "0"')
-    return "\n".join(lines) + "\n"
+        if name in am:
+            param, _ = am[name]
+            if param not in emitted and param not in nm and param not in container_params:
+                emitted.add(param)
+                members = sorted(array_contents[param], key=lambda x: x[0])
+                vals = ", ".join(_var_toml_value(v, model) for _, v in members)
+                flat_lines.append(f"{_pname(param)} = [{vals}]")
+        elif name in tm:
+            param, _ = tm[name]
+            if param not in emitted and param not in nm and param not in container_params:
+                emitted.add(param)
+                members = sorted(tuple_contents[param], key=lambda x: x[0])
+                vals = ", ".join(_var_toml_value(v, model) for _, v in members)
+                flat_lines.append(f"{_pname(param)} = [{vals}]")
+        elif name not in sm:
+            flat_lines.append(f"{_pname(name)} = {_var_toml_value(var, model)}")
+
+    # Build struct blocks, including nested leaves as struct fields.
+    struct_blocks: dict[str, list[str]] = {}
+    for var in circuit.inputs:
+        name = var.name
+        if name in sm:
+            param, field = sm[name]
+            if param not in nm:  # only top-level structs here
+                struct_blocks.setdefault(_pname(param), []).append(f"{field} = {_var_toml_value(var, model)}")
+
+    # Inject nested leaves into their struct containers.
+    for leaf, (container, access_key) in nm.items():
+        if not container.startswith("g"):
+            continue  # tuple container handled below
+        field_name = access_key  # str for struct containers
+        leaf_val = _leaf_toml_value(leaf)
+        struct_blocks.setdefault(_pname(container), []).append(f"{field_name} = {leaf_val}")
+
+    for pkey, field_lines in struct_blocks.items():
+        struct_lines.append(f"[{pkey}]")
+        struct_lines.extend(field_lines)
+
+    # Handle tuple containers: tuples that have structs nested inside.
+    # Collect per-tuple: list of (index, value_str) to build the full tuple array.
+    tuple_nest_extra: dict[str, dict[int, str]] = {}
+    for leaf, (container, access_key) in nm.items():
+        if not container.startswith("tup_"):
+            continue
+        idx = access_key  # int for tuple containers
+        leaf_val = _leaf_toml_value(leaf)
+        tuple_nest_extra.setdefault(container, {})[idx] = leaf_val
+
+    for container, extra in tuple_nest_extra.items():
+        if container in emitted:
+            continue
+        emitted.add(container)
+        # Build tuple array: regular members + nested struct elements.
+        base_members = sorted(tuple_contents.get(container, []), key=lambda x: x[0])
+        # Combine: each position is either a nested leaf or a regular var.
+        all_positions: list[str] = []
+        base_idx = 0
+        struct_idx = 0
+        positions: dict[int, str] = {i: _var_toml_value(v, model) for i, v in base_members}
+        # Renumber: nested structs occupy positions 0..len(extra)-1, regular vars follow.
+        # Actually, emit struct elements first in the tuple, then vars.
+        struct_vals = [extra[k] for k in sorted(extra.keys())]
+        var_vals = [_var_toml_value(v, model) for _, v in base_members]
+        all_vals = struct_vals + var_vals
+        flat_lines.append(f"{_pname(container)} = [{', '.join(all_vals)}]")
+
+    return "\n".join(flat_lines + struct_lines) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -401,11 +661,14 @@ def create_noir_project(
     package_name: str,
     smt_source: str = "",
     smt_filename: str = "",
+    safe_math_source: str = "",
 ) -> None:
     project_dir.mkdir(parents=True, exist_ok=True)
     src_dir = project_dir / "src"
     src_dir.mkdir(exist_ok=True)
     (src_dir / "main.nr").write_text(noir_source)
+    if safe_math_source:
+        (src_dir / "safe_math.nr").write_text(safe_math_source)
     (project_dir / "Prover.toml").write_text(prover_toml)
     (project_dir / "Nargo.toml").write_text(
         f'[package]\nname = "{package_name}"\ntype = "bin"\nauthors = [""]\n\n[dependencies]\n'
@@ -431,6 +694,14 @@ def save_error(
     (dest / "nargo_output.txt").write_text(nargo_output)
 
 
+def _is_assertion_failure(output: str) -> bool:
+    """Return True only when nargo rejected a witness via circuit assertions.
+    A compilation/linking failure (missing module, type error, etc.) is NOT
+    a meaningful oracle rejection and must not be counted as one."""
+    lower = output.lower()
+    return "assertion failed" in lower or "failed assertion" in lower
+
+
 def run_nargo_execute(project_dir: Path, timeout: int = 120) -> tuple[bool, str]:
     """Run `nargo execute` in project_dir.  Returns (success, combined output)."""
     proc = subprocess.run(
@@ -441,6 +712,134 @@ def run_nargo_execute(project_dir: Path, timeout: int = 120) -> tuple[bool, str]
         timeout=timeout,
     )
     return proc.returncode == 0, proc.stdout + proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Variable grouping (structs + arrays)
+# ---------------------------------------------------------------------------
+
+def compute_groupings(
+    circuit,
+    smt_content: str,
+    allow_nesting: bool = False,
+) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, int]], dict[str, tuple[str, int]]]:
+    """
+    Randomly assign each input variable to one of:
+      flat / struct_N / array_N (booleans only) / tuple_N (any type)
+
+    Groups with < 2 members are demoted to flat.
+    Seed = int(md5(smt_content), 16).
+
+    Returns:
+      struct_map : {var_name → (param_name, field_name)}
+      array_map  : {var_name → (param_name, index)}
+      tuple_map  : {var_name → (param_name, index)}
+    """
+    if len(circuit.inputs) < 4:
+        return {}, {}, {}, {}
+
+    seed = int(hashlib.md5(smt_content.encode()).hexdigest(), 16)
+    rng = random.Random(seed)
+
+    buckets = ["flat", "struct_0", "struct_1", "array_0", "array_1", "tuple_0", "tuple_1"]
+    assignments: dict[str, str] = {}
+    for var in circuit.inputs:
+        choice = rng.choice(buckets)
+        if choice.startswith("array") and var.variable_type != VariableType.BOOLEAN:
+            choice = "flat"
+        assignments[var.name] = choice
+
+    # Demote singleton groups to flat.
+    from collections import Counter
+    counts = Counter(assignments.values())
+    for name, bucket in list(assignments.items()):
+        if bucket != "flat" and counts[bucket] < 2:
+            assignments[name] = "flat"
+
+    struct_map: dict[str, tuple[str, str]] = {}
+    array_counters: dict[str, int] = {}
+    array_map: dict[str, tuple[str, int]] = {}
+
+    for var in circuit.inputs:
+        bucket = assignments[var.name]
+        if bucket.startswith("struct"):
+            param = bucket.replace("_", "")   # struct_0 → struct0 → g0
+            param = "g" + bucket[-1]          # g0 / g1
+            struct_map[var.name] = (param, var.name)
+        elif bucket.startswith("array"):
+            param = "bools_" + bucket[-1]     # bools_0 / bools_1
+            idx = array_counters.get(param, 0)
+            array_counters[param] = idx + 1
+            array_map[var.name] = (param, idx)
+
+    tuple_counters: dict[str, int] = {}
+    tuple_map: dict[str, tuple[str, int]] = {}
+    for var in circuit.inputs:
+        bucket = assignments[var.name]
+        if bucket.startswith("tuple"):
+            param = "tup_" + bucket[-1]
+            idx = tuple_counters.get(param, 0)
+            tuple_counters[param] = idx + 1
+            tuple_map[var.name] = (param, idx)
+
+    # Demote singleton tuple groups to flat.
+    from collections import Counter
+    tuple_counts = Counter(p for p, _ in tuple_map.values())
+    tuple_map = {k: v for k, v in tuple_map.items() if tuple_counts[v[0]] >= 2}
+
+    if not allow_nesting:
+        return struct_map, array_map, tuple_map, {}
+
+    # --- Second-level nesting (recursive mode only) ---
+    # Randomly assign leaf groups as fields/elements of container groups.
+    # nesting_map: {leaf_group → (container_group, access_key)}
+    #   access_key is a field name (str) for structs, or an int index for tuples.
+    # Rules:
+    #   - Only struct_0 and struct_1 can be containers (structs are the only composite type)
+    #   - OR tuple_0 / tuple_1 as containers (struct can be a tuple element)
+    #   - A container cannot itself be nested
+    #   - Each container holds at most one nested group per nesting run
+    nesting_map: dict[str, tuple[str, str | int]] = {}
+
+    # Collect which leaf groups exist (non-empty).
+    leaf_groups = (
+        [f"bools_{i}" for i in range(2) if any(v[0] == f"bools_{i}" for v in array_map.values())] +
+        [f"g{i}"    for i in range(2) if any(v[0] == f"g{i}"    for v in struct_map.values())] +
+        [f"tup_{i}" for i in range(2) if any(v[0] == f"tup_{i}" for v in tuple_map.values())]
+    )
+    struct_containers = [f"g{i}" for i in range(2) if any(v[0] == f"g{i}" for v in struct_map.values())]
+    tuple_containers  = [f"tup_{i}" for i in range(2) if any(v[0] == f"tup_{i}" for v in tuple_map.values())]
+    all_containers = struct_containers + tuple_containers
+
+    used_as_container: set[str] = set()
+    used_as_nested: set[str] = set()
+    field_counters: dict[str, int] = {}  # how many fields added to each container
+    tuple_nest_counters: dict[str, int] = {}
+
+    for leaf in rng.sample(leaf_groups, len(leaf_groups)):  # random order
+        if leaf in used_as_nested:
+            continue
+        eligible_containers = [c for c in all_containers
+                                if c != leaf and c not in used_as_nested
+                                and field_counters.get(c, 0) < 2]  # max 2 nested per container
+        if not eligible_containers:
+            continue
+        if not rng.choice([True, False]):  # 50% chance of nesting
+            continue
+        container = rng.choice(eligible_containers)
+        used_as_container.add(container)
+        used_as_nested.add(leaf)
+        field_counters[container] = field_counters.get(container, 0) + 1
+        if container.startswith("tup_"):
+            idx = tuple_nest_counters.get(container, 0)
+            tuple_nest_counters[container] = idx + 1
+            nesting_map[leaf] = (container, idx)
+        else:
+            # struct container: use a field name based on the leaf group
+            field_name = leaf.replace("_", "").replace("bools", "arr").replace("tup", "tup")
+            nesting_map[leaf] = (container, field_name)
+
+    return struct_map, array_map, tuple_map, nesting_map
 
 
 # ---------------------------------------------------------------------------
@@ -479,27 +878,113 @@ def build_boundary_prover_toml(
     int_type_map: dict[str, IntegerType],
     rng: random.Random,
     mul_factors: dict[str, int] | None = None,
+    struct_map: dict[str, tuple[str, str]] | None = None,
+    array_map: dict[str, tuple[str, int]] | None = None,
+    tuple_map: dict[str, tuple[str, int]] | None = None,
+    nesting_map: dict[str, tuple[str, str | int]] | None = None,
+    param_name_map: dict[str, str] | None = None,
 ) -> str:
-    """Build a Prover.toml by sampling boundary values for each variable.
-    Integer bounds are clamped by the multiplication factor to prevent overflow."""
+    """Build a boundary-value Prover.toml respecting struct/array/tuple/nesting groupings."""
     factors = mul_factors or {}
-    lines: list[str] = []
+    sm = struct_map or {}
+    am = array_map or {}
+    tm = tuple_map or {}
+    nm = nesting_map or {}
+    pnm = param_name_map or {}
+
+    def _pname(p: str) -> str:
+        return pnm.get(p, p)
+
+    def _bval(var) -> str:
+        if var.variable_type == VariableType.BOOLEAN:
+            return rng.choice(["true", "false"])
+        t = int_type_map.get(var.name, IntegerType(64, True))
+        lo, hi = _type_bounds(t)
+        k = factors.get(var.name, 1)
+        if k > 1:
+            safe = hi // k
+            lo, hi = max(lo, -safe), safe
+        pool = sorted(set(v for v in [lo, lo+1, -1, 0, 1, hi-1, hi] if lo <= v <= hi))
+        return str(rng.choice(pool))
+
+    def _bfmt(var) -> str:
+        v = _bval(var)
+        return v if var.variable_type == VariableType.BOOLEAN else f'"{v}"'
+
+    array_contents: dict[str, list] = {}
+    for var in circuit.inputs:
+        if var.name in am:
+            param, idx = am[var.name]
+            array_contents.setdefault(param, []).append((idx, var))
+
+    tuple_contents: dict[str, list] = {}
+    for var in circuit.inputs:
+        if var.name in tm:
+            param, idx = tm[var.name]
+            tuple_contents.setdefault(param, []).append((idx, var))
+
+    def _leaf_boundary(leaf: str) -> str:
+        if leaf in array_contents:
+            members = sorted(array_contents[leaf], key=lambda x: x[0])
+            return "[" + ", ".join(_bval(v) for _, v in members) + "]"
+        if leaf in tuple_contents:
+            members = sorted(tuple_contents[leaf], key=lambda x: x[0])
+            return "[" + ", ".join(_bfmt(v) for _, v in members) + "]"
+        fields = [(f, v) for v in circuit.inputs
+                  if v.name in sm and sm[v.name][0] == leaf
+                  for _, f in [sm[v.name]]]
+        if fields:
+            inner = ", ".join(f"{f} = {_bfmt(v)}" for f, v in fields)
+            return "{" + inner + "}"
+        return '""'
+
+    container_params_b: set[str] = {cont for _, (cont, _) in nm.items()}
+
+    flat_lines: list[str] = []
+    struct_lines: list[str] = []
+    emitted: set[str] = set()
+
     for var in circuit.inputs:
         name = var.name
-        if var.variable_type == VariableType.BOOLEAN:
-            lines.append(f"{name} = {rng.choice(['true', 'false'])}")
-        else:
-            t = int_type_map.get(name, IntegerType(64, True))
-            lo, hi = _type_bounds(t)
-            k = factors.get(name, 1)
-            if k > 1:
-                safe = hi // k
-                lo, hi = -safe, safe
-            candidates = [lo, lo + 1, -1, 0, 1, hi - 1, hi]
-            pool = sorted(set(v for v in candidates if lo <= v <= hi))
-            val = rng.choice(pool)
-            lines.append(f'{name} = "{val}"')
-    return "\n".join(lines) + "\n"
+        if name in am:
+            param, _ = am[name]
+            if param not in emitted and param not in nm and param not in container_params_b:
+                emitted.add(param)
+                members = sorted(array_contents[param], key=lambda x: x[0])
+                flat_lines.append(f"{_pname(param)} = [{', '.join(_bval(v) for _, v in members)}]")
+        elif name in tm:
+            param, _ = tm[name]
+            if param not in emitted and param not in nm and param not in container_params_b:
+                emitted.add(param)
+                members = sorted(tuple_contents[param], key=lambda x: x[0])
+                flat_lines.append(f"{_pname(param)} = [{', '.join(_bfmt(v) for _, v in members)}]")
+        elif name not in sm:
+            flat_lines.append(f"{_pname(name)} = {_bfmt(var)}")
+
+    struct_blocks: dict[str, list[str]] = {}
+    for var in circuit.inputs:
+        name = var.name
+        if name in sm:
+            param, field = sm[name]
+            if param not in nm:
+                struct_blocks.setdefault(_pname(param), []).append(f"{field} = {_bfmt(var)}")
+
+    for leaf, (container, access_key) in nm.items():
+        if container.startswith("g"):
+            struct_blocks.setdefault(_pname(container), []).append(f"{access_key} = {_leaf_boundary(leaf)}")
+
+    for pkey, field_lines in struct_blocks.items():
+        struct_lines.append(f"[{pkey}]")
+        struct_lines.extend(field_lines)
+
+    for leaf, (container, access_key) in nm.items():
+        if container.startswith("tup_") and container not in emitted:
+            emitted.add(container)
+            struct_vals = [_leaf_boundary(leaf)]
+            var_vals = [_bfmt(v) for _, v in sorted(tuple_contents.get(container, []), key=lambda x: x[0])]
+            flat_lines.append(f"{_pname(container)} = [{', '.join(struct_vals + var_vals)}]")
+
+    return "\n".join(flat_lines + struct_lines) + "\n"
 
 
 def _is_unsat_with_fix(
@@ -508,18 +993,23 @@ def _is_unsat_with_fix(
     fixed_value: str,
     int_vars: set[str],
     int_type_map: dict[str, IntegerType],
+    safe_arith_bounds: list[str] | None = None,
     timeout: int = 10,
 ) -> bool:
     """Return True if the formula is UNSAT when var_name is forced to fixed_value."""
     base = _strip_check_commands(smt_content)
     bounds = _bounds_clauses(int_vars, int_type_map)
     fix = f"(assert (= {var_name} {fixed_value}))"
-    query = base + "\n" + "\n".join(bounds) + "\n" + fix + "\n(check-sat)\n"
+    extra = bounds + (safe_arith_bounds or [])
+    query = base + "\n" + "\n".join(extra) + "\n" + fix + "\n(check-sat)\n"
     proc = subprocess.run(
         ["z3", "-in"], input=query,
         capture_output=True, text=True, timeout=timeout,
     )
     return proc.stdout.strip().startswith("unsat")
+
+
+_INT_FLIP_DELTAS = [1, -1]
 
 
 def find_sat_oracle_input(
@@ -528,11 +1018,17 @@ def find_sat_oracle_input(
     model: dict,
     int_vars: set[str],
     int_type_map: dict[str, IntegerType],
+    safe_arith_bounds: list[str] | None = None,
 ) -> dict | None:
     """
-    Try flipping each boolean variable in model one at a time.
-    Return the first modified model that Z3 confirms is UNSAT, or None.
+    Try minimal single-variable modifications that Z3 confirms make the formula UNSAT.
+
+    1. Flip each boolean (only one other value).
+    2. Add/subtract small deltas to each integer (within the variable's type bounds).
+
+    Returns the first modified model found, or None.
     """
+    # --- Boolean flips ---
     for var in circuit.inputs:
         if var.variable_type != VariableType.BOOLEAN:
             continue
@@ -540,10 +1036,33 @@ def find_sat_oracle_input(
         flipped = 'false' if current == 'true' else 'true'
         try:
             if _is_unsat_with_fix(smt_content, var.name, flipped,
-                                  int_vars, int_type_map):
+                                  int_vars, int_type_map, safe_arith_bounds):
                 return {**model, var.name: ('Bool', flipped)}
         except subprocess.TimeoutExpired:
             continue
+
+    # --- Integer mutations (±deltas) ---
+    for var in circuit.inputs:
+        if var.variable_type != VariableType.INTEGER:
+            continue
+        raw = model.get(var.name, ('Int', '0'))[1]
+        try:
+            current_val = int(raw)
+        except ValueError:
+            continue
+        t = int_type_map.get(var.name, IntegerType(64, True))
+        lo, hi = _type_bounds(t)
+        for delta in _INT_FLIP_DELTAS:
+            new_val = current_val + delta
+            if not (lo <= new_val <= hi):
+                continue
+            try:
+                if _is_unsat_with_fix(smt_content, var.name, str(new_val),
+                                      int_vars, int_type_map, safe_arith_bounds):
+                    return {**model, var.name: ('Int', str(new_val))}
+            except subprocess.TimeoutExpired:
+                continue
+
     return None
 
 
@@ -568,6 +1087,12 @@ def main() -> None:
         metavar="FILE",
         help="JSON file with smtfuzz flags (default: smtfuzz_config.json). "
              "Used only in generate mode.",
+    )
+    parser.add_argument(
+        "--generator-config",
+        default="generator_config.json",
+        metavar="FILE",
+        help="JSON file with generator options (default: generator_config.json).",
     )
     parser.add_argument(
         "--output-dir",
@@ -611,6 +1136,24 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    gen_config: dict = {}
+    gen_config_path = Path(args.generator_config)
+    if gen_config_path.exists():
+        with gen_config_path.open() as f:
+            gen_config = json.load(f)
+    variables_bundling = gen_config.get("variables_bundling", "simple")
+    if variables_bundling not in ("flat", "simple", "recursive"):
+        sys.exit(f"Error: variables_bundling must be flat, simple or recursive, got '{variables_bundling}'")
+    solver = gen_config.get("solver", "z3")
+    if solver not in ("z3", "cvc5", "z3_to_cvc5"):
+        sys.exit(f"Error: solver must be z3, cvc5, or z3_to_cvc5, got '{solver}'")
+    # CLI args override config values; config values override hardcoded defaults.
+    if args.z3_timeout == 30:      # still at default → use config
+        args.z3_timeout = gen_config.get("solver_timeout", 30)
+    if args.nargo_timeout == 120:  # still at default → use config
+        args.nargo_timeout = gen_config.get("nargo_timeout", 120)
+
+
     output_dir = Path(args.output_dir)
     generate_mode = args.input_dir is None
 
@@ -648,7 +1191,12 @@ def main() -> None:
     unsat_dir.mkdir(parents=True, exist_ok=True)
     sat_to_unsat_dir.mkdir(parents=True, exist_ok=True)
     (errors_dir / "error").mkdir(parents=True, exist_ok=True)
+    (errors_dir / "overflow").mkdir(parents=True, exist_ok=True)
     (errors_dir / "timeout").mkdir(parents=True, exist_ok=True)
+    (errors_dir / "smt_solver_errors").mkdir(parents=True, exist_ok=True)
+    (errors_dir / "z3_error_cvc5_succ").mkdir(parents=True, exist_ok=True)
+    (errors_dir / "sat_to_unsat_pipeline").mkdir(parents=True, exist_ok=True)
+    (errors_dir / "unsat_pipeline").mkdir(parents=True, exist_ok=True)
 
     # Enforce --keep-runs: delete only the out/ of old runs — errors/ is never touched.
     all_runs = sorted(output_dir.glob("run-*"))   # lexicographic = chronological
@@ -666,7 +1214,10 @@ def main() -> None:
         print(f"Run ID: {run_id}  →  {run_dir}")
 
     emitter = EmitVisitor()
-    ok = n_error = n_timeout = skipped = 0
+    sat_ok = sat_error = sat_overflow = 0
+    unsat_ok = unsat_error = unsat_pipeline_error = 0
+    oracle_ok = oracle_bug = oracle_skip = oracle_pipeline_error = 0
+    n_timeout = skipped = 0
 
     def _iter_formulas():
         """Yield (stem, smt_content) for either folder or generate mode."""
@@ -692,8 +1243,13 @@ def main() -> None:
         try:
             circuit = parse_smtlib2(smt_content)
         except Exception as exc:
-            print(f"  SKIP (parse error): {exc}")
-            skipped += 1
+            print(f"  ERROR (parse error): {exc}")
+            sat_error += 1
+            # Store as error with only the smt file (no Noir source yet).
+            dest = errors_dir / "error" / f"obj.{stem}-parse"
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / smt_filename).write_text(smt_content)
+            (dest / "nargo_output.txt").write_text(f"PARSE ERROR: {exc}\n")
             continue
 
         declared = {v.name for v in circuit.inputs}
@@ -702,42 +1258,109 @@ def main() -> None:
 
         int_type_map: dict[str, IntegerType] = {}
         mul_factors: dict[str, int] = {}
+        safe_arith_bounds: list[str] = []
         if int_var_names:
-            mul_factors  = _collect_mul_factors(circuit)
-            int_type_map = assign_int_types(int_var_names, smt_content, circuit)
+            mul_factors       = _collect_mul_factors(circuit)
+            int_type_map      = assign_int_types(int_var_names, smt_content, circuit)
+            safe_arith_bounds = collect_safe_arith_bounds(circuit, int_type_map)
             types_summary = ", ".join(f"{n}:{t}" for n, t in int_type_map.items())
             print(f"  Types: {types_summary}")
 
+        if variables_bundling == "flat":
+            struct_map, array_map, tuple_map, nesting_map = {}, {}, {}, {}
+        else:
+            struct_map, array_map, tuple_map, nesting_map = compute_groupings(
+                circuit, smt_content,
+                allow_nesting=(variables_bundling == "recursive"),
+            )
+        # Seeded RNG for per-expression randomization (comptime, helpers).
+        # Offset by 3 to be independent of the grouping seed (offset 0) and
+        # the UNSAT boundary seed (offset 1).
+        ir_rng = random.Random(int(hashlib.md5(smt_content.encode()).hexdigest(), 16) + 3)
+
         # 2. Circuit IR → Noir source
         try:
-            noir_doc = IR2NoirVisitor(int_type_map=int_type_map).transform(circuit)
+            visitor = IR2NoirVisitor(
+                int_type_map=int_type_map,
+                safe_arithmetic=(gen_config.get("arithmetic_mode", "safe") == "safe"),
+                struct_map=struct_map,
+                array_map=array_map,
+                tuple_map=tuple_map,
+                nesting_map=nesting_map,
+                rng=ir_rng,
+            )
+            noir_doc = visitor.transform(circuit)
             noir_source = emitter.emit(noir_doc)
+            safe_math_src = build_safe_math_source(visitor.safe_fns_needed) if visitor.safe_fns_needed else ""
+            param_name_map = visitor.param_name_map
         except Exception as exc:
-            print(f"  SKIP (Noir translation error): {exc}")
-            skipped += 1
+            import traceback
+            print(f"  ERROR (Noir translation error): {exc}")
+            sat_error += 1
+            dest = errors_dir / "error" / f"obj.{stem}-translation"
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / smt_filename).write_text(smt_content)
+            (dest / "nargo_output.txt").write_text(
+                f"TRANSLATION ERROR: {exc}\n\n{traceback.format_exc()}"
+            )
             continue
 
-        # 3. Enumerate satisfying models with Z3
+        # 3. Enumerate satisfying models with the configured solver
+        _enum_kwargs = dict(
+            timeout=args.z3_timeout,
+            int_vars=int_vars,
+            int_type_map=int_type_map,
+            mul_factors=mul_factors,
+            safe_arith_bounds=safe_arith_bounds,
+        )
+        z3_failed_error: Exception | None = None
+        active_solver = solver
+
         try:
-            models = enumerate_models(
-                smt_content,
-                declared,
-                args.max_witnesses,
-                timeout=args.z3_timeout,
-                int_vars=int_vars,
-                int_type_map=int_type_map,
-                mul_factors=mul_factors,
-            )
+            if solver == "z3_to_cvc5":
+                # Try Z3 first; fall back to cvc5 on error.
+                try:
+                    models = enumerate_models(smt_content, declared, args.max_witnesses,
+                                              solver="z3", **_enum_kwargs)
+                    active_solver = "z3"
+                except Exception as z3_exc:
+                    z3_failed_error = z3_exc
+                    print(f"  Z3 failed ({z3_exc}), retrying with cvc5 ...")
+                    models = enumerate_models(smt_content, declared, args.max_witnesses,
+                                              solver="cvc5", **_enum_kwargs)
+                    active_solver = "cvc5"
+            else:
+                models = enumerate_models(smt_content, declared, args.max_witnesses,
+                                          solver=solver, **_enum_kwargs)
+                active_solver = solver
         except subprocess.TimeoutExpired:
-            print("  SKIP (Z3 timed out)")
-            skipped += 1
+            print(f"  ERROR (solver timed out)")
+            n_timeout += 1
             continue
-        except FileNotFoundError:
-            sys.exit("Error: 'z3' not found in PATH.")
+        except FileNotFoundError as exc:
+            sys.exit(f"Error: solver not found in PATH: {exc}")
         except Exception as exc:
-            print(f"  SKIP (Z3 error): {exc}")
-            skipped += 1
+            # Both solvers failed (or single solver failed).
+            label = f"z3_then_cvc5" if solver == "z3_to_cvc5" else active_solver
+            print(f"  ERROR ({label} error): {exc}")
+            sat_error += 1
+            dest = errors_dir / "smt_solver_errors" / f"obj.{stem}-{label}error"
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / smt_filename).write_text(smt_content)
+            (dest / "src").mkdir(exist_ok=True)
+            (dest / "src" / "main.nr").write_text(noir_source)
+            (dest / "nargo_output.txt").write_text(f"SOLVER ERROR: {exc}\n")
             continue
+
+        # If Z3 failed but cvc5 succeeded — save to dedicated folder for analysis.
+        if z3_failed_error is not None:
+            dest = errors_dir / "z3_error_cvc5_succ" / f"obj.{stem}"
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / smt_filename).write_text(smt_content)
+            (dest / "nargo_output.txt").write_text(
+                f"Z3 ERROR: {z3_failed_error}\ncvc5 found {len(models)} model(s)\n"
+            )
+            # Continue processing — use the cvc5 models for witness generation.
 
         if not models:
             # UNSAT oracle: run N boundary-value samples — all must be rejected.
@@ -747,9 +1370,10 @@ def main() -> None:
                 folder_name = f"obj.{stem}-{idx}"
                 pkg_name    = _sanitize_name(folder_name)
                 project_dir = unsat_dir / folder_name
-                boundary_toml = build_boundary_prover_toml(circuit, int_type_map, rng_unsat, mul_factors)
+                boundary_toml = build_boundary_prover_toml(circuit, int_type_map, rng_unsat, mul_factors, struct_map, array_map, tuple_map, nesting_map, param_name_map)
                 create_noir_project(project_dir, noir_source, boundary_toml, pkg_name,
-                                    smt_source=smt_content, smt_filename=smt_filename)
+                                    smt_source=smt_content, smt_filename=smt_filename,
+                                    safe_math_source=safe_math_src)
                 print(f"  [{folder_name}] unsat boundary  ... ", end="", flush=True)
                 timed_out = False
                 try:
@@ -760,7 +1384,7 @@ def main() -> None:
                     sys.exit("Error: 'nargo' not found in PATH.")
                 if u_ok:
                     print("BUG")
-                    n_error += 1
+                    unsat_error += 1
                     save_error(errors_dir, "error", folder_name + "_unsat_oracle",
                                noir_source, boundary_toml, pkg_name,
                                smt_content, smt_filename,
@@ -768,8 +1392,16 @@ def main() -> None:
                 elif timed_out:
                     print("TIMEOUT")
                     n_timeout += 1
-                else:
+                elif _is_assertion_failure(u_out):
                     print("ok (correctly rejected)")
+                    unsat_ok += 1
+                else:
+                    print("PIPELINE ERROR")
+                    unsat_pipeline_error += 1
+                    save_error(errors_dir, "unsat_pipeline", folder_name,
+                               noir_source, boundary_toml, pkg_name,
+                               smt_content, smt_filename,
+                               "UNSAT PIPELINE ERROR: nargo failed but not via assertion\n" + u_out)
             continue
 
         print(f"  {len(models)} satisfying model(s) found")
@@ -780,10 +1412,11 @@ def main() -> None:
             pkg_name = _sanitize_name(folder_name)
             project_dir = sat_dir / folder_name
 
-            prover_toml = model_to_prover_toml(model, circuit)
+            prover_toml = model_to_prover_toml(model, circuit, struct_map, array_map, tuple_map, nesting_map, param_name_map)
             create_noir_project(
                 project_dir, noir_source, prover_toml, pkg_name,
                 smt_source=smt_content, smt_filename=smt_filename,
+                safe_math_source=safe_math_src,
             )
 
             print(f"  [{folder_name}] nargo execute   ... ", end="", flush=True)
@@ -800,16 +1433,17 @@ def main() -> None:
             if success:
                 witness_path = project_dir / "target" / f"{pkg_name}.gz"
                 print(f"OK  →  {witness_path}")
-                ok += 1
+                sat_ok += 1
 
                 # SAT oracle: find a minimal UNSAT modification and assert nargo rejects it.
                 oracle_model = find_sat_oracle_input(
-                    smt_content, circuit, model, int_vars, int_type_map)
+                    smt_content, circuit, model, int_vars, int_type_map, safe_arith_bounds)
                 if oracle_model is not None:
-                    oracle_toml = model_to_prover_toml(oracle_model, circuit)
+                    oracle_toml = model_to_prover_toml(oracle_model, circuit, struct_map, array_map, tuple_map, nesting_map, param_name_map)
                     oracle_dir = sat_to_unsat_dir / folder_name
                     create_noir_project(oracle_dir, noir_source, oracle_toml, pkg_name,
-                                        smt_source=smt_content, smt_filename=smt_filename)
+                                        smt_source=smt_content, smt_filename=smt_filename,
+                                        safe_math_source=safe_math_src)
                     print(f"  [{folder_name}] sat oracle      ... ", end="", flush=True)
                     try:
                         o_ok, o_out = run_nargo_execute(oracle_dir, timeout=args.nargo_timeout)
@@ -817,15 +1451,24 @@ def main() -> None:
                         o_ok, o_out = False, ""
                     if o_ok:
                         print("BUG")
-                        n_error += 1
+                        oracle_bug += 1
                         save_error(errors_dir, "error", folder_name + "_sat_oracle",
                                    noir_source, oracle_toml, pkg_name,
                                    smt_content, smt_filename,
                                    "SAT ORACLE VIOLATION: nargo accepted a Z3-UNSAT input\n" + o_out)
-                    else:
+                    elif _is_assertion_failure(o_out):
                         print("ok (correctly rejected)")
+                        oracle_ok += 1
+                    else:
+                        print("PIPELINE ERROR")
+                        oracle_pipeline_error += 1
+                        save_error(errors_dir, "sat_to_unsat_pipeline", folder_name,
+                                   noir_source, oracle_toml, pkg_name,
+                                   smt_content, smt_filename,
+                                   "SAT_TO_UNSAT PIPELINE ERROR: nargo failed but not via assertion\n" + o_out)
                 else:
-                    print(f"  [{folder_name}] sat oracle      ... skipped (no boolean flip found UNSAT)")
+                    print(f"  [{folder_name}] sat oracle      ... skipped (no UNSAT mutation found)")
+                    oracle_skip += 1
 
             elif timed_out:
                 print("TIMEOUT")
@@ -834,19 +1477,30 @@ def main() -> None:
                            noir_source, prover_toml, pkg_name,
                            smt_content, smt_filename, "")
             else:
-                print("ERROR")
+                is_overflow = "overflow" in output.lower()
+                category = "overflow" if is_overflow else "error"
+                print("OVERFLOW" if is_overflow else "ERROR")
                 first_error = next(
                     (l for l in output.splitlines() if "error" in l.lower()),
                     output.splitlines()[0] if output.strip() else "(no output)"
                 )
                 print(f"    {first_error}")
-                n_error += 1
-                save_error(errors_dir, "error", folder_name,
+                if is_overflow:
+                    sat_overflow += 1
+                else:
+                    sat_error += 1
+                save_error(errors_dir, category, folder_name,
                            noir_source, prover_toml, pkg_name,
                            smt_content, smt_filename, output)
 
+    total_bugs = sat_error + unsat_error + oracle_bug
     print(f"\n{'='*60}")
-    print(f"Results: {ok} ok  |  {n_error} error  |  {n_timeout} timeout  |  {skipped} skipped")
+    print(f"sat         : {sat_ok} ok  |  {sat_error} error  |  {sat_overflow} overflow")
+    print(f"unsat       : {unsat_ok} ok  |  {unsat_error} bug  |  {unsat_pipeline_error} pipeline")
+    print(f"sat_to_unsat: {oracle_ok} ok  |  {oracle_bug} bug  |  {oracle_skip} no-flip  |  {oracle_pipeline_error} pipeline")
+    print(f"timeout     : {n_timeout}")
+    print(f"{'─'*40}")
+    print(f"total bugs  : {total_bugs}  (overflows not counted as bugs)")
 
 
 if __name__ == "__main__":
