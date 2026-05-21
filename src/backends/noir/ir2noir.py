@@ -60,6 +60,98 @@ def _min_signed_type(val: int) -> IntegerType:
     return IntegerType(64, True)
 
 
+_INT_TYPE_POOL = [
+    IntegerType(8,  True),  IntegerType(16, True),  IntegerType(32, True),  IntegerType(64, True),
+    IntegerType(8,  False), IntegerType(16, False), IntegerType(32, False), IntegerType(64, False),
+]
+
+def _type_bounds(t: IntegerType) -> tuple[int, int]:
+    if t.signed:
+        return -(2 ** (t.bits - 1)), (2 ** (t.bits - 1)) - 1
+    return 0, (2 ** min(t.bits, 63)) - 1
+
+
+def _pick_const_type(val: int, rng: random.Random) -> IntegerType:
+    """Pick a random Noir type that can hold val. Negative values require signed types."""
+    valid = [t for t in _INT_TYPE_POOL
+             if (t.signed or val >= 0) and _type_bounds(t)[0] <= val <= _type_bounds(t)[1]]
+    return rng.choice(valid) if valid else IntegerType(64, True)
+
+
+def recompute_types(
+    circuit: IRNodes.Circuit,
+    int_type_map: dict[str, IntegerType],
+    rng: random.Random | None = None,
+) -> None:
+    """Walk every expression in the circuit bottom-up and set expr.noir_type.
+    If rng is provided, integer literals get randomly chosen types (not just i64)."""
+
+    def _walk(expr: IRNodes.Expression) -> NoirType:
+        # Post-order: set children first, then this node.
+        if isinstance(expr, IRNodes.UnaryExpression):
+            _walk(expr.value)
+        elif isinstance(expr, IRNodes.BinaryExpression):
+            _walk(expr.lhs); _walk(expr.rhs)
+        elif isinstance(expr, IRNodes.TernaryExpression):
+            _walk(expr.condition); _walk(expr.if_expr); _walk(expr.else_expr)
+
+        if isinstance(expr, IRNodes.Variable):
+            if expr.variable_type == IRNodes.VariableType.INTEGER:
+                t: NoirType = int_type_map.get(expr.name, IntegerType(64, True))
+            else:
+                t = BoolType()
+        elif isinstance(expr, IRNodes.Integer):
+            t = _pick_const_type(expr.value, rng) if rng is not None else IntegerType(64, True)
+        elif isinstance(expr, IRNodes.Boolean):
+            t = BoolType()
+        elif isinstance(expr, IRNodes.UnaryExpression):
+            if expr.op == IRNodes.Operator.SUB:
+                inner = expr.value.noir_type
+                if isinstance(inner, IntegerType) and not inner.signed:
+                    t = IntegerType(_UNSIGNED_NEG_PROMOTION.get(inner.bits, 64), True)
+                else:
+                    t = inner
+            else:
+                t = BoolType()
+        elif isinstance(expr, IRNodes.BinaryExpression):
+            if (expr.op in IRNodes.Operator.relation_connectives()
+                    or expr.op in IRNodes.Operator.logic_connectives()):
+                t = BoolType()
+            else:
+                lt, rt = expr.lhs.noir_type, expr.rhs.noir_type
+                if isinstance(lt, IntegerType) and isinstance(rt, IntegerType):
+                    t = _common_int_type(lt, rt)
+                elif isinstance(lt, IntegerType):
+                    t = lt
+                elif isinstance(rt, IntegerType):
+                    t = rt
+                else:
+                    t = BoolType()
+        elif isinstance(expr, IRNodes.TernaryExpression):
+            lt, rt = expr.if_expr.noir_type, expr.else_expr.noir_type
+            if isinstance(lt, IntegerType) and isinstance(rt, IntegerType):
+                t = _common_int_type(lt, rt)
+            elif isinstance(lt, IntegerType):
+                t = lt
+            elif isinstance(rt, IntegerType):
+                t = rt
+            else:
+                t = BoolType()
+        else:
+            t = BoolType()
+
+        expr.noir_type = t
+        return t
+
+    for var in circuit.inputs:
+        _walk(var)
+    for stmt in circuit.statements:
+        if isinstance(stmt, (IRNodes.Assertion, IRNodes.Assume)):
+            _walk(stmt.value if isinstance(stmt, IRNodes.Assertion) else stmt.condition)
+        elif isinstance(stmt, IRNodes.Assignment):
+            _walk(stmt.lhs); _walk(stmt.rhs)
+
+
 def _common_int_type(t1: IntegerType, t2: IntegerType) -> IntegerType:
     """Promotion: max width, signed if either operand is signed.
     When both have equal width but opposite signedness, promote to the next
@@ -87,7 +179,6 @@ class IR2NoirVisitor:
     def __init__(
         self,
         int_type_map: dict[str, IntegerType] | None = None,
-        safe_arithmetic: bool = True,
         struct_map: dict[str, tuple[str, str]] | None = None,
         array_map: dict[str, tuple[str, int]] | None = None,
         tuple_map: dict[str, tuple[str, int]] | None = None,
@@ -105,8 +196,7 @@ class IR2NoirVisitor:
         self._array_map: dict[str, tuple[str, int]] = array_map or {}
         self._tuple_map: dict[str, tuple[str, int]] = tuple_map or {}
         self._nesting_map: dict[str, tuple[str, str | int]] = nesting_map or {}
-        self._safe_arithmetic = safe_arithmetic
-        # (op_name, bits, signed) — safe functions needed; populated during visit
+        # (op_name="abs", bits, signed) — abs functions needed; populated during visit
         self.safe_fns_needed: set[tuple[str, int, bool]] = set()
         self._rng = rng
         # Maps base IntegerType str → alias name (populated in visit_circuit).
@@ -211,54 +301,22 @@ class IR2NoirVisitor:
     def visit_integer(self, node: IRNodes.Integer) -> tuple[Expression, list[Statement]]:
         return IntegerLiteral(node.value), []
 
-    def _expr_int_type(self, expr: IRNodes.Expression) -> IntegerType | None:
-        """Return the concrete Noir integer type of an IR expression, or None for booleans/fields."""
-        match expr:
-            case IRNodes.Variable() if expr.variable_type == IRNodes.VariableType.INTEGER:
-                return self._int_type_map.get(expr.name, IntegerType(64, True))
-            case IRNodes.Integer():
-                # Every integer literal has a concrete minimum signed type — no more None.
-                return _min_signed_type(expr.value)
-            case IRNodes.UnaryExpression() if expr.op == IRNodes.Operator.SUB:
-                t = self._expr_int_type(expr.value)
-                if t is None:
-                    return None
-                if not t.signed:
-                    promo = _UNSIGNED_NEG_PROMOTION.get(t.bits, 64)
-                    return IntegerType(promo, signed=True)
-                return t
-            case IRNodes.BinaryExpression() if expr.op in IRNodes.Operator.arithmetic_connectives():
-                # Always check if the whole expression is constant first.
-                val = _fold_expr_constant(expr)
-                if val is not None:
-                    return _min_signed_type(val)
-                lt = self._expr_int_type(expr.lhs)
-                rt = self._expr_int_type(expr.rhs)
-                if lt is None and rt is None:
-                    return None
-                if lt is None:
-                    return rt
-                if rt is None:
-                    return lt
-                return _common_int_type(lt, rt)
-            case IRNodes.TernaryExpression():
-                lt = self._expr_int_type(expr.if_expr)
-                rt = self._expr_int_type(expr.else_expr)
-                if lt is None:
-                    return rt
-                if rt is None:
-                    return lt
-                return _common_int_type(lt, rt)
-            case _:
-                return None
+    def _expr_type(self, expr: IRNodes.Expression) -> NoirType:
+        """Return the Noir type of an expression (pre-computed by recompute_types)."""
+        if expr.noir_type is None:
+            raise RuntimeError(
+                f"expr.noir_type is None on {expr.__class__.__name__}: {expr}. "
+                "recompute_types() must be called before visiting the circuit."
+            )
+        return expr.noir_type
 
     def visit_unary_expression(self, node: IRNodes.UnaryExpression) -> tuple[Expression, list[Statement]]:
         value_expr, statements = self.visit_expression(node.value)
         op = self.visit_operator(node.op)
         # Unary negation of an unsigned type: promote to signed before negating.
         if node.op == IRNodes.Operator.SUB:
-            t = self._expr_int_type(node.value)
-            if t is not None and not t.signed:
+            t = self._expr_type(node.value)
+            if isinstance(t, IntegerType) and not t.signed:
                 promo = _UNSIGNED_NEG_PROMOTION.get(t.bits, 64)
                 value_expr = CastExpression(value_expr, IntegerType(promo, signed=True))
         return UnaryExpression(op, value_expr), statements
@@ -287,31 +345,12 @@ class IR2NoirVisitor:
         statements += rhs_tail
         op = self.visit_operator(node.op)
 
-        lt = self._expr_int_type(node.lhs)
-        rt = self._expr_int_type(node.rhs)
+        lt = self._expr_type(node.lhs)
+        rt = self._expr_type(node.rhs)
 
-        # For safe arithmetic ops, determine the type from the WHOLE expression
-        # (constant-folding aware) so operand-level anchoring (e.g. -29 → i64)
-        # doesn't widen the safe function beyond what the result actually needs.
-        if (self._safe_arithmetic
-                and node.op in (IRNodes.Operator.ADD, IRNodes.Operator.MUL, IRNodes.Operator.SUB)):
-            expr_t = self._expr_int_type(node)
-            if isinstance(expr_t, IntegerType):
-                # Cast each typed operand directly to the safe_type.
-                if lt is not None and lt != expr_t:
-                    lhs = CastExpression(lhs, expr_t)
-                if rt is not None and rt != expr_t:
-                    rhs = CastExpression(rhs, expr_t)
-                op_name = "add" if node.op == IRNodes.Operator.ADD else \
-                          "mul" if node.op == IRNodes.Operator.MUL else "sub"
-                self.safe_fns_needed.add((op_name, expr_t.bits, expr_t.signed))
-                final_expr: Expression = FunctionCall(
-                    Identifier(f"safe_math::safe_{op_name}_{expr_t}"), [lhs, rhs])
-                return self._maybe_intermediate(node, final_expr, statements)
-
-        # Non-safe path: insert casts for type-differing operands.
+        # Insert casts for type-differing integer operands.
         common: IntegerType | None = None
-        if lt is not None and rt is not None and lt != rt:
+        if isinstance(lt, IntegerType) and isinstance(rt, IntegerType) and lt != rt:
             common = _common_int_type(lt, rt)
             if lt != common:
                 lhs = CastExpression(lhs, common)
@@ -378,14 +417,14 @@ class IR2NoirVisitor:
         # Detect abs pattern and emit safe_math::safe_abs_T instead of tmp if/else.
         inner = self._is_abs_pattern(node)
         if inner is not None:
-            t = self._expr_int_type(inner)
+            t = self._expr_type(inner)
             # Only use safe_abs for signed types. For unsigned, abs is the identity
             # and the ternary's natural type is wider/signed (due to -x promotion),
             # so let normal ternary handling emit the correct casts.
             if isinstance(t, IntegerType) and t.signed:
                 inner_expr, inner_stmts = self.visit_expression(inner)
                 self.safe_fns_needed.add(("abs", t.bits, t.signed))
-                call = FunctionCall(Identifier(f"safe_math::safe_abs_{t}"), [inner_expr])
+                call = FunctionCall(Identifier(f"safe_math::abs_{t}"), [inner_expr])
                 return call, inner_stmts
 
         statements: list[Statement] = []
@@ -396,16 +435,16 @@ class IR2NoirVisitor:
 
         # Determine result type from both branches so the declaration matches
         # the actual assigned type (e.g. if one branch needs promotion to i32).
-        lt = self._expr_int_type(node.if_expr)
-        rt = self._expr_int_type(node.else_expr)
-        if lt is not None and rt is not None and lt != rt:
+        lt = self._expr_type(node.if_expr)
+        rt = self._expr_type(node.else_expr)
+        if isinstance(lt, IntegerType) and isinstance(rt, IntegerType) and lt != rt:
             result_type: NoirType = _common_int_type(lt, rt)
-        elif lt is not None:
+        elif isinstance(lt, IntegerType):
             result_type = lt
-        elif rt is not None:
+        elif isinstance(rt, IntegerType):
             result_type = rt
         else:
-            result_type = self._infer_type(node.if_expr)
+            result_type = lt  # both are BoolType
 
         default_value: Expression = BooleanLiteral(False) if isinstance(result_type, BoolType) else IntegerLiteral(0)
         statements.append(LetStatement(result_name.copy(), default_value, result_type, is_mutable=True))
@@ -892,13 +931,4 @@ class IR2NoirVisitor:
         return FieldType()
 
     def _infer_type(self, expr: IRNodes.Expression) -> NoirType:
-        if expr.is_boolean_expression():
-            return BoolType()
-        t = self._expr_int_type(expr)
-        if t is not None:
-            return t
-        raise TypeError(
-            f"Cannot infer integer type for expression {expr.__class__.__name__}: {expr}. "
-            "Every integer expression must have a deterministic type — "
-            "check that all Variables are in int_type_map and all literals are Integer nodes."
-        )
+        return self._expr_type(expr)

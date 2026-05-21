@@ -35,10 +35,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.smt_to_ir.parser import parse_smtlib2
-from src.backends.noir.ir2noir import IR2NoirVisitor, _fold_expr_constant
+from src.backends.noir.ir2noir import IR2NoirVisitor, _fold_expr_constant, recompute_types
 from src.backends.noir.emitter import EmitVisitor
 from src.backends.noir.types import IntegerType
 from src.ir.nodes import VariableType, Variable, Circuit, BinaryExpression, Integer as IRInteger
+from src.witnesses.generator import find_witness
 
 
 # ---------------------------------------------------------------------------
@@ -144,88 +145,97 @@ def ir_expr_to_smt(expr) -> str | None:
     return None
 
 
-def smt_expr_int_type(expr, int_type_map: dict):
-    """Standalone type inference for IR expressions — mirrors ir2noir._expr_int_type."""
+def smt_expr_type(expr, int_type_map: dict):
+    """Standalone type inference for IR expressions — mirrors ir2noir._expr_type. Never returns None."""
     from src.ir.nodes import Integer as IRInt, Variable as IRVar, BinaryExpression as IRBin, \
         UnaryExpression as IRUnary, TernaryExpression as IRTernary, Operator as IROp, VariableType
     from src.backends.noir.ir2noir import _common_int_type, _min_signed_type, \
         _UNSIGNED_NEG_PROMOTION, _fold_expr_constant
-    from src.backends.noir.types import IntegerType
-    if isinstance(expr, IRVar) and expr.variable_type == VariableType.INTEGER:
-        return int_type_map.get(expr.name, IntegerType(64, True))
+    from src.backends.noir.types import IntegerType, BoolType
+    if isinstance(expr, IRVar):
+        if expr.variable_type == VariableType.INTEGER:
+            return int_type_map.get(expr.name, IntegerType(64, True))
+        return BoolType()
     if isinstance(expr, IRInt):
-        return _min_signed_type(expr.value)  # every integer literal has a concrete type
-    if isinstance(expr, IRUnary) and expr.op == IROp.SUB:
-        t = smt_expr_int_type(expr.value, int_type_map)
-        if t is None:
-            return None
-        if not t.signed:
-            return IntegerType(_UNSIGNED_NEG_PROMOTION.get(t.bits, 64), True)
-        return t
+        return _min_signed_type(expr.value)
+    if isinstance(expr, IRUnary):
+        if expr.op == IROp.SUB:
+            t = smt_expr_type(expr.value, int_type_map)
+            if isinstance(t, IntegerType) and not t.signed:
+                return IntegerType(_UNSIGNED_NEG_PROMOTION.get(t.bits, 64), True)
+            return t
+        return BoolType()
     if isinstance(expr, IRTernary):
-        # Use the common (widest) type across both branches.
-        lt = smt_expr_int_type(expr.if_expr, int_type_map)
-        rt = smt_expr_int_type(expr.else_expr, int_type_map)
-        if lt is None and rt is None:
-            return None
-        if lt is None:
-            return rt
-        if rt is None:
+        lt = smt_expr_type(expr.if_expr, int_type_map)
+        rt = smt_expr_type(expr.else_expr, int_type_map)
+        if isinstance(lt, IntegerType) and isinstance(rt, IntegerType):
+            return _common_int_type(lt, rt)
+        if isinstance(lt, IntegerType):
             return lt
-        return _common_int_type(lt, rt)
+        if isinstance(rt, IntegerType):
+            return rt
+        return BoolType()
     if isinstance(expr, IRBin) and expr.op in (IROp.ADD, IROp.SUB, IROp.MUL):
-        # Constant-fold first, matching how _expr_int_type works in ir2noir.py.
-        # Without this, 82+99 gets typed as i8 (from operand types) rather than
-        # i16 (from the folded result 181), causing spuriously tight bounds in Z3.
         val = _fold_expr_constant(expr)
         if val is not None:
             return _min_signed_type(val)
-        lt = smt_expr_int_type(expr.lhs, int_type_map)
-        rt = smt_expr_int_type(expr.rhs, int_type_map)
-        if lt is None and rt is None:
-            return None
-        if lt is None:
-            return rt
-        if rt is None:
+        lt = smt_expr_type(expr.lhs, int_type_map)
+        rt = smt_expr_type(expr.rhs, int_type_map)
+        if isinstance(lt, IntegerType) and isinstance(rt, IntegerType):
+            return _common_int_type(lt, rt)
+        if isinstance(lt, IntegerType):
             return lt
-        return _common_int_type(lt, rt)
-    return None
+        if isinstance(rt, IntegerType):
+            return rt
+        return BoolType()
+    return BoolType()
 
 
-def collect_safe_arith_bounds(circuit, int_type_map: dict) -> list[str]:
+def build_type_bounds(circuit) -> list[str]:
     """
-    Walk all assertions and for every ADD/SUB/MUL sub-expression with a known
-    integer type, emit Z3 bounds clauses that mirror the safe_math assertions.
+    Walk every expression in the circuit. For each integer-typed subexpression,
+    add (assert (>= expr MIN)) and (assert (<= expr MAX)) using the type stored
+    on expr.noir_type (set by recompute_types).
     """
     from src.ir.nodes import (
-        BinaryExpression as IRBin, UnaryExpression as IRUnary,
-        TernaryExpression as IRTernary, Assertion, Operator as IROp,
+        Expression as IRExpr, Integer as IRNodes_Integer, BinaryExpression as IRBin,
+        UnaryExpression as IRUnary, TernaryExpression as IRTernary, Assertion, Assume,
+        Assignment, Operator as IROp,
     )
-    SAFE_OPS = (IROp.ADD, IROp.SUB, IROp.MUL)
+    from src.backends.noir.types import IntegerType
     clauses: list[str] = []
     seen: set[str] = set()
 
     def _walk(node) -> None:
         if isinstance(node, IRBin):
-            if node.op in SAFE_OPS:
-                smt_str = ir_expr_to_smt(node)
-                t = smt_expr_int_type(node, int_type_map)
-                if smt_str is not None and t is not None and smt_str not in seen:
-                    seen.add(smt_str)
-                    lo, hi = _type_bounds(t)
-                    clauses.append(f"(assert (>= {smt_str} {lo}))")
-                    clauses.append(f"(assert (<= {smt_str} {hi}))")
-            _walk(node.lhs)
-            _walk(node.rhs)
+            _walk(node.lhs); _walk(node.rhs)
         elif isinstance(node, IRUnary):
             _walk(node.value)
         elif isinstance(node, IRTernary):
             _walk(node.condition); _walk(node.if_expr); _walk(node.else_expr)
-        elif isinstance(node, Assertion):
-            _walk(node.value)
+
+        if not isinstance(node, IRExpr):
+            return
+        if isinstance(node, IRNodes_Integer):
+            return  # constants are always within their own range by construction
+        t = node.noir_type
+        if not isinstance(t, IntegerType):
+            return
+        smt_str = ir_expr_to_smt(node)
+        if smt_str is None or smt_str in seen:
+            return
+        seen.add(smt_str)
+        lo, hi = _type_bounds(t)
+        clauses.append(f"(assert (>= {smt_str} {lo}))")
+        clauses.append(f"(assert (<= {smt_str} {hi}))")
 
     for stmt in circuit.statements:
-        _walk(stmt)
+        if isinstance(stmt, Assertion):
+            _walk(stmt.value)
+        elif isinstance(stmt, Assume):
+            _walk(stmt.condition)
+        elif isinstance(stmt, Assignment):
+            _walk(stmt.rhs)
     return clauses
 
 
@@ -338,17 +348,14 @@ def assign_int_types(
     rng = random.Random(seed)
 
     const_ranges = _collect_var_const_ranges(circuit) if circuit else {}
-    mul_factors  = _collect_mul_factors(circuit)       if circuit else {}
 
     result: dict[str, IntegerType] = {}
     for name in int_var_names:
         min_c, max_c = const_ranges.get(name, (0, 0))
-        k = mul_factors.get(name, 1)
         valid = [
             t for t in _INT_TYPE_POOL
             if _type_bounds(t)[0] <= min_c
             and _type_bounds(t)[1] >= max_c
-            and _type_bounds(t)[1] // k >= 1   # product chain fits in type
         ]
         result[name] = rng.choice(valid) if valid else IntegerType(64, True)
 
@@ -399,61 +406,30 @@ def _blocking_clause(model: dict[str, tuple[str, str]], declared: set[str]) -> s
 
 
 def build_safe_math_source(fns_needed: set[tuple[str, int, bool]]) -> str:
-    """Generate safe_math.nr source for safe_add/sub/mul/abs per type."""
+    """Generate safe_math.nr source — only abs functions are emitted."""
     lines: list[str] = []
     for op_name, bits, signed in sorted(fns_needed):
+        if op_name != "abs":
+            continue
         type_str = f"{'i' if signed else 'u'}{bits}"
-        fn_name = f"safe_{op_name}_{type_str}"
-        if op_name == "abs":
-            if not signed:
-                # Unsigned values are always non-negative; abs is the identity.
-                lines += [
-                    f"pub fn {fn_name}(a: {type_str}) -> {type_str} {{",
-                    f"    a",
-                    f"}}",
-                    "",
-                ]
-            else:
-                lines += [
-                    f"pub fn {fn_name}(a: {type_str}) -> {type_str} {{",
-                    f"    if a >= 0 {{ a }} else {{ -a }}",
-                    f"}}",
-                    "",
-                ]
-        else:
-            noir_op = {"add": "+", "sub": "-", "mul": "*"}[op_name]
-            lo = -(2 ** (bits - 1)) if signed else 0
-            hi = (2 ** (bits - 1) - 1) if signed else (2 ** min(bits, 63)) - 1
+        fn_name = f"{op_name}_{type_str}"
+        if not signed:
             lines += [
-                f"pub fn {fn_name}(a: {type_str}, b: {type_str}) -> {type_str} {{",
-                f"    let c: {type_str} = a {noir_op} b;",
-                f"    assert(c >= {lo}, \"{fn_name}_lb\");",
-                f"    assert(c <= {hi}, \"{fn_name}_ub\");",
-                f"    c",
+                f"pub fn {fn_name}(a: {type_str}) -> {type_str} {{",
+                f"    a",
+                f"}}",
+                "",
+            ]
+        else:
+            lines += [
+                f"pub fn {fn_name}(a: {type_str}) -> {type_str} {{",
+                f"    if a >= 0 {{ a }} else {{ -a }}",
                 f"}}",
                 "",
             ]
     return "\n".join(lines)
 
 
-def _bounds_clauses(
-    int_vars: set[str],
-    type_map: dict[str, IntegerType],
-    mul_factors: dict[str, int] | None = None,
-) -> list[str]:
-    """Return (assert ...) clauses bounding each integer variable (type range + mul-factor)."""
-    factors = mul_factors or {}
-    clauses = []
-    for v in sorted(int_vars):
-        t = type_map.get(v, IntegerType(64, True))
-        lo, hi = _type_bounds(t)
-        k = factors.get(v, 1)
-        if k > 1:
-            safe = hi // k
-            lo, hi = max(lo, -safe), safe
-        clauses.append(f"(assert (>= {v} {lo}))")
-        clauses.append(f"(assert (<= {v} {hi}))")
-    return clauses
 
 
 def _solver_cmd(solver: str) -> list[str]:
@@ -467,19 +443,16 @@ def enumerate_models(
     declared: set[str],
     max_models: int,
     timeout: int = 30,
-    int_vars: set[str] | None = None,
-    int_type_map: dict[str, IntegerType] | None = None,
-    mul_factors: dict[str, int] | None = None,
-    safe_arith_bounds: list[str] | None = None,
+    circuit=None,
     solver: str = "z3",
 ) -> list[dict[str, tuple[str, str]]]:
     """
     Call the SMT solver repeatedly with blocking clauses to collect up to max_models
-    satisfying assignments (type range + mul-factor + safe-arithmetic bounds).
+    satisfying assignments, bounded by the type of every integer subexpression.
     """
     base = _strip_check_commands(smt_content)
-    bounds = _bounds_clauses(int_vars or set(), int_type_map or {}, mul_factors)
-    extra: list[str] = bounds[:] + (safe_arith_bounds or [])
+    bounds = build_type_bounds(circuit) if circuit is not None else []
+    extra: list[str] = bounds[:]
     models: list[dict[str, tuple[str, str]]] = []
 
     for _ in range(max_models):
@@ -905,7 +878,6 @@ def build_boundary_prover_toml(
     circuit,
     int_type_map: dict[str, IntegerType],
     rng: random.Random,
-    mul_factors: dict[str, int] | None = None,
     struct_map: dict[str, tuple[str, str]] | None = None,
     array_map: dict[str, tuple[str, int]] | None = None,
     tuple_map: dict[str, tuple[str, int]] | None = None,
@@ -913,7 +885,6 @@ def build_boundary_prover_toml(
     param_name_map: dict[str, str] | None = None,
 ) -> str:
     """Build a boundary-value Prover.toml respecting struct/array/tuple/nesting groupings."""
-    factors = mul_factors or {}
     sm = struct_map or {}
     am = array_map or {}
     tm = tuple_map or {}
@@ -928,10 +899,6 @@ def build_boundary_prover_toml(
             return rng.choice(["true", "false"])
         t = int_type_map.get(var.name, IntegerType(64, True))
         lo, hi = _type_bounds(t)
-        k = factors.get(var.name, 1)
-        if k > 1:
-            safe = hi // k
-            lo, hi = max(lo, -safe), safe
         pool = sorted(set(v for v in [lo, lo+1, -1, 0, 1, hi-1, hi] if lo <= v <= hi))
         return str(rng.choice(pool))
 
@@ -1019,17 +986,14 @@ def _is_unsat_with_fix(
     smt_content: str,
     var_name: str,
     fixed_value: str,
-    int_vars: set[str],
-    int_type_map: dict[str, IntegerType],
-    safe_arith_bounds: list[str] | None = None,
+    circuit,
     timeout: int = 10,
 ) -> tuple[bool, str]:
     """Return (is_unsat, z3_query) — query saved for reproduction if oracle fires."""
     base = _strip_check_commands(smt_content)
-    bounds = _bounds_clauses(int_vars, int_type_map)
+    bounds = build_type_bounds(circuit)
     fix = f"(assert (= {var_name} {fixed_value}))"
-    extra = bounds + (safe_arith_bounds or [])
-    query = base + "\n" + "\n".join(extra) + "\n" + fix + "\n(check-sat)\n"
+    query = base + "\n" + "\n".join(bounds) + "\n" + fix + "\n(check-sat)\n"
     proc = subprocess.run(
         ["z3", "-in"], input=query,
         capture_output=True, text=True, timeout=timeout,
@@ -1044,9 +1008,7 @@ def find_sat_oracle_input(
     smt_content: str,
     circuit,
     model: dict,
-    int_vars: set[str],
     int_type_map: dict[str, IntegerType],
-    safe_arith_bounds: list[str] | None = None,
 ) -> tuple[dict, str] | None:
     """
     Try minimal single-variable modifications that Z3 confirms make the formula UNSAT.
@@ -1059,8 +1021,7 @@ def find_sat_oracle_input(
         current = model.get(var.name, ('Bool', 'false'))[1]
         flipped = 'false' if current == 'true' else 'true'
         try:
-            is_unsat, query = _is_unsat_with_fix(smt_content, var.name, flipped,
-                                                  int_vars, int_type_map, safe_arith_bounds)
+            is_unsat, query = _is_unsat_with_fix(smt_content, var.name, flipped, circuit)
             if is_unsat:
                 return {**model, var.name: ('Bool', flipped)}, query
         except subprocess.TimeoutExpired:
@@ -1082,8 +1043,7 @@ def find_sat_oracle_input(
             if not (lo <= new_val <= hi):
                 continue
             try:
-                is_unsat, query = _is_unsat_with_fix(smt_content, var.name, str(new_val),
-                                                      int_vars, int_type_map, safe_arith_bounds)
+                is_unsat, query = _is_unsat_with_fix(smt_content, var.name, str(new_val), circuit)
                 if is_unsat:
                     return {**model, var.name: ('Int', str(new_val))}, query
             except subprocess.TimeoutExpired:
@@ -1280,17 +1240,14 @@ def main() -> None:
 
         declared = {v.name for v in circuit.inputs}
         int_var_names = [v.name for v in circuit.inputs if v.variable_type == VariableType.INTEGER]
-        int_vars = set(int_var_names)
 
         int_type_map: dict[str, IntegerType] = {}
-        mul_factors: dict[str, int] = {}
-        safe_arith_bounds: list[str] = []
         if int_var_names:
-            mul_factors       = _collect_mul_factors(circuit)
-            int_type_map      = assign_int_types(int_var_names, smt_content, circuit)
-            safe_arith_bounds = collect_safe_arith_bounds(circuit, int_type_map)
+            int_type_map = assign_int_types(int_var_names, smt_content, circuit)
             types_summary = ", ".join(f"{n}:{t}" for n, t in int_type_map.items())
             print(f"  Types: {types_summary}")
+        const_type_rng = random.Random(int(hashlib.md5(smt_content.encode()).hexdigest(), 16) + 5)
+        recompute_types(circuit, int_type_map, rng=const_type_rng)
 
         if variables_bundling == "flat":
             struct_map, array_map, tuple_map, nesting_map = {}, {}, {}, {}
@@ -1308,7 +1265,6 @@ def main() -> None:
         try:
             visitor = IR2NoirVisitor(
                 int_type_map=int_type_map,
-                safe_arithmetic=(gen_config.get("arithmetic_mode", "safe") == "safe"),
                 struct_map=struct_map,
                 array_map=array_map,
                 tuple_map=tuple_map,
@@ -1333,41 +1289,35 @@ def main() -> None:
 
         # Build the Z3 query for SAT model enumeration (saved alongside any SAT errors
         # so they can be reproduced independently outside the fuzzer).
+        _type_bounds_clauses = build_type_bounds(circuit)
         _z3_sat_query = (
             _strip_check_commands(smt_content)
             + "\n"
-            + "\n".join(_bounds_clauses(int_vars, int_type_map, mul_factors)
-                         + (safe_arith_bounds or []))
+            + "\n".join(_type_bounds_clauses)
             + "\n(check-sat)\n(get-model)\n"
         )
 
-        # 3. Enumerate satisfying models with the configured solver
-        _enum_kwargs = dict(
-            timeout=args.z3_timeout,
-            int_vars=int_vars,
-            int_type_map=int_type_map,
-            mul_factors=mul_factors,
-            safe_arith_bounds=safe_arith_bounds,
-        )
+        # 3. Find a satisfying witness using the witness generator module.
         z3_failed_error: Exception | None = None
         active_solver = solver
+        models: list[dict] = []
+
+        def _run_solver(s: str) -> tuple[list[dict], str]:
+            model, query = find_witness(smt_content, circuit, solver=s, timeout=args.z3_timeout)
+            return ([model] if model is not None else []), query
 
         try:
             if solver == "z3_to_cvc5":
-                # Try Z3 first; fall back to cvc5 on error.
                 try:
-                    models = enumerate_models(smt_content, declared, args.max_witnesses,
-                                              solver="z3", **_enum_kwargs)
+                    models, _z3_sat_query = _run_solver("z3")
                     active_solver = "z3"
                 except Exception as z3_exc:
                     z3_failed_error = z3_exc
                     print(f"  Z3 failed ({z3_exc}), retrying with cvc5 ...")
-                    models = enumerate_models(smt_content, declared, args.max_witnesses,
-                                              solver="cvc5", **_enum_kwargs)
+                    models, _z3_sat_query = _run_solver("cvc5")
                     active_solver = "cvc5"
             else:
-                models = enumerate_models(smt_content, declared, args.max_witnesses,
-                                          solver=solver, **_enum_kwargs)
+                models, _z3_sat_query = _run_solver(solver)
                 active_solver = solver
         except subprocess.TimeoutExpired:
             print(f"  ERROR (solver timed out)")
@@ -1376,8 +1326,7 @@ def main() -> None:
         except FileNotFoundError as exc:
             sys.exit(f"Error: solver not found in PATH: {exc}")
         except Exception as exc:
-            # Both solvers failed (or single solver failed).
-            label = f"z3_then_cvc5" if solver == "z3_to_cvc5" else active_solver
+            label = "z3_then_cvc5" if solver == "z3_to_cvc5" else active_solver
             print(f"  ERROR ({label} error): {exc}")
             sat_error += 1
             dest = errors_dir / "smt_solver_errors" / f"obj.{stem}-{label}error"
@@ -1407,15 +1356,14 @@ def main() -> None:
             _z3_unsat_query = (
                 _strip_check_commands(smt_content)
                 + "\n"
-                + "\n".join(_bounds_clauses(int_vars, int_type_map, mul_factors)
-                             + (safe_arith_bounds or []))
+                + "\n".join(_type_bounds_clauses)
                 + "\n(check-sat)\n(get-model)\n"
             )
             for idx in range(args.max_witnesses):
                 folder_name = f"obj.{stem}-{idx}"
                 pkg_name    = _sanitize_name(folder_name)
                 project_dir = unsat_dir / folder_name
-                boundary_toml = build_boundary_prover_toml(circuit, int_type_map, rng_unsat, mul_factors, struct_map, array_map, tuple_map, nesting_map, param_name_map)
+                boundary_toml = build_boundary_prover_toml(circuit, int_type_map, rng_unsat, struct_map, array_map, tuple_map, nesting_map, param_name_map)
                 create_noir_project(project_dir, noir_source, boundary_toml, pkg_name,
                                     smt_source=smt_content, smt_filename=smt_filename,
                                     safe_math_source=safe_math_src, z3_query=_z3_unsat_query)
@@ -1485,7 +1433,7 @@ def main() -> None:
 
                 # SAT oracle: find a minimal UNSAT modification and assert nargo rejects it.
                 oracle_result = find_sat_oracle_input(
-                    smt_content, circuit, model, int_vars, int_type_map, safe_arith_bounds)
+                    smt_content, circuit, model, int_type_map)
                 if oracle_result is not None:
                     oracle_model, oracle_z3_query = oracle_result
                     oracle_toml = model_to_prover_toml(oracle_model, circuit, struct_map, array_map, tuple_map, nesting_map, param_name_map)

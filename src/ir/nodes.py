@@ -14,7 +14,10 @@ except ImportError:  # Python < 3.11
 from dataclasses import dataclass
 from dataclasses import field
 from itertools import count
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.backends.noir.types import NoirType
 
 
 class Operator(StrEnum):
@@ -95,6 +98,9 @@ class Statement(IRNode):
 
 @dataclass
 class Expression(IRNode):
+    # Populated by recompute_types() after type assignment — never set in __init__.
+    noir_type: Any = field(default=None, init=False, repr=False, compare=False)
+
     def copy(self) -> 'Expression':
         raise NotImplementedError()
 

@@ -1,6 +1,5 @@
 {
   "variables_bundling": "simple",
-  "arithmetic_mode": "safe",
   "solver": "z3_to_cvc5",
   "solver_timeout": 15,
   "nargo_timeout": 30
