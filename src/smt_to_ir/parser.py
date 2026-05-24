@@ -532,6 +532,4 @@ def parse_smtlib2(smtlib2: str, solver: str = "z3") -> Circuit:
         or re.search(r"\bff\.(add|mul|neg|sub)\b", smtlib2)
     ):
         return parse_smtlib2_ff(smtlib2)
-    if re.search(r"\(set-logic\s+QF_LIA\b", smtlib2) or re.search(r"\(\s*declare-fun\s+\S+\s+\(\)\s+Int\b", smtlib2):
-        return parse_smtlib2_lia(smtlib2)
-    return parse_smtlib2_core(smtlib2, solver=solver)
+    return parse_smtlib2_lia(smtlib2)

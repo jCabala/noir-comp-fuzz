@@ -35,459 +35,53 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.smt_to_ir.parser import parse_smtlib2
-from src.backends.noir.ir2noir import IR2NoirVisitor, _fold_expr_constant, recompute_types
+from src.backends.noir.ir2noir import IR2NoirVisitor, recompute_types, _type_bounds
 from src.backends.noir.emitter import EmitVisitor
 from src.backends.noir.types import IntegerType
-from src.ir.nodes import VariableType, Variable, Circuit, BinaryExpression, Integer as IRInteger
-from src.witnesses.generator import find_witness
+from src.ir.nodes import VariableType
+from src.witnesses.generator import find_witness, build_type_bounds, _strip_check_commands
 
 
-# ---------------------------------------------------------------------------
-# Z3 helpers
-# ---------------------------------------------------------------------------
-
-def _strip_check_commands(smt: str) -> str:
-    """Remove check-sat, get-model, get-value commands so we can add our own."""
-    out = []
-    for line in smt.splitlines():
-        s = line.strip()
-        if s.startswith(("(check-sat", "(get-model", "(get-value", "(exit")):
-            continue
-        out.append(line)
-    return "\n".join(out)
-
-
-_DEFINE_FUN_RE = re.compile(
-    r'\(define-fun\s+(\S+)\s+\(\)\s+(\S+)\s+((?:[^()]+|\([^()]*\))*)\)',
-    re.DOTALL,
-)
-
-_I64_MIN = -(2 ** 63)
-_I64_MAX = 2 ** 63 - 1
-
-# All supported integer types for randomized assignment.
-_INT_TYPE_POOL = [
-    IntegerType(8,  True),   # i8
-    IntegerType(16, True),   # i16
-    IntegerType(32, True),   # i32
-    IntegerType(64, True),   # i64
-    IntegerType(8,  False),  # u8
-    IntegerType(16, False),  # u16
-    IntegerType(32, False),  # u32
-    IntegerType(64, False),  # u64  (Z3 bounds capped at [0, 2^63-1] for safe negation)
-]
-
-def _type_bounds(t: IntegerType) -> tuple[int, int]:
-    """Return the (lo, hi) Z3 integer bounds for a Noir integer type."""
-    if t.signed:
-        lo = -(2 ** (t.bits - 1))
-        hi =  (2 ** (t.bits - 1)) - 1
-    else:
-        lo = 0
-        # Cap u64 at i64 max so unary negation (via i64 promotion) never overflows.
-        hi = (2 ** min(t.bits, 63)) - 1
-    return lo, hi
-
-
-def _effective_mul_factor(expr, var_name: str) -> int | None:
-    """
-    Return the total constant multiplication factor accumulated on top of
-    var_name in expr, or None if var_name doesn't appear in expr.
-
-    For ((v * 95) * 95) * 81:  returns 95 * 95 * 81 = 731,025
-    Only follows MUL chains where one side is purely constant at each step.
-    """
-    from src.ir.nodes import BinaryExpression as IRBin, Variable as IRVar, Operator as IROp
-    if isinstance(expr, IRVar):
-        return 1 if expr.name == var_name else None
-    if isinstance(expr, IRBin) and expr.op == IROp.MUL:
-        lc = _fold_expr_constant(expr.lhs)
-        rc = _fold_expr_constant(expr.rhs)
-        if rc is not None:
-            sub = _effective_mul_factor(expr.lhs, var_name)
-            if sub is not None:
-                return abs(rc) * sub
-        if lc is not None:
-            sub = _effective_mul_factor(expr.rhs, var_name)
-            if sub is not None:
-                return abs(lc) * sub
-    return None
-
-
-def ir_expr_to_smt(expr) -> str | None:
-    """Convert an IR expression to its SMT-LIB2 string, or None if not convertible."""
-    from src.ir.nodes import Integer as IRInt, Variable as IRVar, BinaryExpression as IRBin, \
-        UnaryExpression as IRUnary, TernaryExpression as IRTernary, Operator as IROp, VariableType
-    if isinstance(expr, IRInt):
-        return f"(- {abs(expr.value)})" if expr.value < 0 else str(expr.value)
-    if isinstance(expr, IRVar):
-        return expr.name if expr.variable_type == VariableType.INTEGER else None
-    if isinstance(expr, IRUnary) and expr.op == IROp.SUB:
-        inner = ir_expr_to_smt(expr.value)
-        return f"(- {inner})" if inner is not None else None
-    if isinstance(expr, IRBin):
-        # Comparison operators for ternary conditions
-        cmp_ops = {IROp.EQU: '=', IROp.NEQ: None, IROp.LTH: '<',
-                   IROp.LEQ: '<=', IROp.GTH: '>', IROp.GEQ: '>='}
-        arith_ops = {IROp.ADD: '+', IROp.SUB: '-', IROp.MUL: '*'}
-        smt_op = arith_ops.get(expr.op) or cmp_ops.get(expr.op)
-        if smt_op is None:
-            return None
-        l = ir_expr_to_smt(expr.lhs)
-        r = ir_expr_to_smt(expr.rhs)
-        return f"({smt_op} {l} {r})" if l is not None and r is not None else None
-    if isinstance(expr, IRTernary):
-        cond = ir_expr_to_smt(expr.condition)
-        if_s = ir_expr_to_smt(expr.if_expr)
-        else_s = ir_expr_to_smt(expr.else_expr)
-        if cond is not None and if_s is not None and else_s is not None:
-            return f"(ite {cond} {if_s} {else_s})"
-    return None
-
-
-def smt_expr_type(expr, int_type_map: dict):
-    """Standalone type inference for IR expressions — mirrors ir2noir._expr_type. Never returns None."""
-    from src.ir.nodes import Integer as IRInt, Variable as IRVar, BinaryExpression as IRBin, \
-        UnaryExpression as IRUnary, TernaryExpression as IRTernary, Operator as IROp, VariableType
-    from src.backends.noir.ir2noir import _common_int_type, _min_signed_type, \
-        _UNSIGNED_NEG_PROMOTION, _fold_expr_constant
-    from src.backends.noir.types import IntegerType, BoolType
-    if isinstance(expr, IRVar):
-        if expr.variable_type == VariableType.INTEGER:
-            return int_type_map.get(expr.name, IntegerType(64, True))
-        return BoolType()
-    if isinstance(expr, IRInt):
-        return _min_signed_type(expr.value)
-    if isinstance(expr, IRUnary):
-        if expr.op == IROp.SUB:
-            t = smt_expr_type(expr.value, int_type_map)
-            if isinstance(t, IntegerType) and not t.signed:
-                return IntegerType(_UNSIGNED_NEG_PROMOTION.get(t.bits, 64), True)
-            return t
-        return BoolType()
-    if isinstance(expr, IRTernary):
-        lt = smt_expr_type(expr.if_expr, int_type_map)
-        rt = smt_expr_type(expr.else_expr, int_type_map)
-        if isinstance(lt, IntegerType) and isinstance(rt, IntegerType):
-            return _common_int_type(lt, rt)
-        if isinstance(lt, IntegerType):
-            return lt
-        if isinstance(rt, IntegerType):
-            return rt
-        return BoolType()
-    if isinstance(expr, IRBin) and expr.op in (IROp.ADD, IROp.SUB, IROp.MUL):
-        val = _fold_expr_constant(expr)
-        if val is not None:
-            return _min_signed_type(val)
-        lt = smt_expr_type(expr.lhs, int_type_map)
-        rt = smt_expr_type(expr.rhs, int_type_map)
-        if isinstance(lt, IntegerType) and isinstance(rt, IntegerType):
-            return _common_int_type(lt, rt)
-        if isinstance(lt, IntegerType):
-            return lt
-        if isinstance(rt, IntegerType):
-            return rt
-        return BoolType()
-    return BoolType()
-
-
-def build_type_bounds(circuit) -> list[str]:
-    """
-    Walk every expression in the circuit. For each integer-typed subexpression,
-    add (assert (>= expr MIN)) and (assert (<= expr MAX)) using the type stored
-    on expr.noir_type (set by recompute_types).
-    """
-    from src.ir.nodes import (
-        Expression as IRExpr, Integer as IRNodes_Integer, BinaryExpression as IRBin,
-        UnaryExpression as IRUnary, TernaryExpression as IRTernary, Assertion, Assume,
-        Assignment, Operator as IROp,
-    )
-    from src.backends.noir.types import IntegerType
-    clauses: list[str] = []
-    seen: set[str] = set()
-
-    def _walk(node) -> None:
-        if isinstance(node, IRBin):
-            _walk(node.lhs); _walk(node.rhs)
-        elif isinstance(node, IRUnary):
-            _walk(node.value)
-        elif isinstance(node, IRTernary):
-            _walk(node.condition); _walk(node.if_expr); _walk(node.else_expr)
-
-        if not isinstance(node, IRExpr):
-            return
-        if isinstance(node, IRNodes_Integer):
-            return  # constants are always within their own range by construction
-        t = node.noir_type
-        if not isinstance(t, IntegerType):
-            return
-        smt_str = ir_expr_to_smt(node)
-        if smt_str is None or smt_str in seen:
-            return
-        seen.add(smt_str)
-        lo, hi = _type_bounds(t)
-        clauses.append(f"(assert (>= {smt_str} {lo}))")
-        clauses.append(f"(assert (<= {smt_str} {hi}))")
-
-    for stmt in circuit.statements:
-        if isinstance(stmt, Assertion):
-            _walk(stmt.value)
-        elif isinstance(stmt, Assume):
-            _walk(stmt.condition)
-        elif isinstance(stmt, Assignment):
-            _walk(stmt.rhs)
-    return clauses
-
-
-def _collect_mul_factors(circuit: Circuit) -> dict[str, int]:
-    """
-    Walk all assertions and return, for each INTEGER variable, the maximum
-    effective multiplication factor seen in any MUL chain containing it.
-    """
-    from src.ir.nodes import (
-        BinaryExpression as IRBin, UnaryExpression as IRUnary,
-        TernaryExpression as IRTernary, Assertion, Variable as IRVar, Operator as IROp,
-    )
-    factors: dict[str, int] = {}
-
-    def _update(name: str, factor: int) -> None:
-        factors[name] = max(factors.get(name, 1), factor)
-
-    def _walk(node) -> None:
-        if isinstance(node, IRBin):
-            if node.op == IROp.MUL:
-                # Try to find a variable on either side and compute its factor.
-                for var in circuit.inputs:
-                    if var.variable_type != VariableType.INTEGER:
-                        continue
-                    f = _effective_mul_factor(node, var.name)
-                    if f is not None and f > 1:
-                        _update(var.name, f)
-            _walk(node.lhs)
-            _walk(node.rhs)
-        elif isinstance(node, IRUnary):
-            _walk(node.value)
-        elif isinstance(node, IRTernary):
-            _walk(node.condition); _walk(node.if_expr); _walk(node.else_expr)
-        elif isinstance(node, Assertion):
-            _walk(node.value)
-
-    for stmt in circuit.statements:
-        _walk(stmt)
-    return factors
-
-
-def _collect_var_const_ranges(circuit: Circuit) -> dict[str, tuple[int, int]]:
-    """
-    Walk every assertion in the circuit and collect, for each INTEGER variable,
-    the min/max integer literals that appear as its **direct sibling** in a
-    binary expression.
-
-    "Direct sibling" means the two children of the same BinaryExpression node
-    are exactly one Variable and one Integer — not buried deeper.
-
-    Returns {var_name: (min_const, max_const)}.
-    """
-    ranges: dict[str, tuple[int, int]] = {}
-
-    def _update(name: str, val: int) -> None:
-        lo, hi = ranges.get(name, (val, val))
-        ranges[name] = (min(lo, val), max(hi, val))
-
-    def _walk(node) -> None:
-        from src.ir.nodes import (
-            BinaryExpression as IRBin, UnaryExpression as IRUnary,
-            TernaryExpression as IRTernary, Assertion, Variable as IRVar,
-        )
-        if isinstance(node, IRBin):
-            lhs, rhs = node.lhs, node.rhs
-            # One side is an INTEGER variable, the other is a constant-only
-            # expression (bare literal OR compound like 29*29).  Fold the
-            # constant side to get the effective value seen by the variable.
-            lhs_const = _fold_expr_constant(lhs) if not isinstance(lhs, IRVar) else None
-            rhs_const = _fold_expr_constant(rhs) if not isinstance(rhs, IRVar) else None
-            if isinstance(lhs, IRVar) and lhs.variable_type == VariableType.INTEGER \
-                    and rhs_const is not None:
-                _update(lhs.name, rhs_const)
-            elif isinstance(rhs, IRVar) and rhs.variable_type == VariableType.INTEGER \
-                    and lhs_const is not None:
-                _update(rhs.name, lhs_const)
-            _walk(lhs)
-            _walk(rhs)
-        elif isinstance(node, IRUnary):
-            _walk(node.value)
-        elif isinstance(node, IRTernary):
-            _walk(node.condition)
-            _walk(node.if_expr)
-            _walk(node.else_expr)
-        elif isinstance(node, Assertion):
-            _walk(node.value)
-
-    for stmt in circuit.statements:
-        _walk(stmt)
-
-    return ranges
-
-
-def assign_int_types(
-    int_var_names: list[str],
-    smt_content: str,
-    circuit: Circuit | None = None,
-) -> dict[str, IntegerType]:
-    """
-    Deterministically assign a Noir integer type to each Int variable.
-
-    Filters the type pool by two constraints per variable:
-    1. Direct-sibling constant range: type must cover all constants directly
-       compared with / added to the variable.
-    2. Effective multiplication factor K: type.max // K >= 1, so the full
-       chain v * K never overflows (Z3 bounds will be clamped to ±type.max//K).
-    Falls back to i64 when nothing else fits.
-    """
-    seed = int(hashlib.md5(smt_content.encode()).hexdigest(), 16)
-    rng = random.Random(seed)
-
-    const_ranges = _collect_var_const_ranges(circuit) if circuit else {}
-
-    result: dict[str, IntegerType] = {}
-    for name in int_var_names:
-        min_c, max_c = const_ranges.get(name, (0, 0))
-        valid = [
-            t for t in _INT_TYPE_POOL
-            if _type_bounds(t)[0] <= min_c
-            and _type_bounds(t)[1] >= max_c
-        ]
-        result[name] = rng.choice(valid) if valid else IntegerType(64, True)
-
-    return result
-
-
-def _z3_val_to_str(raw: str) -> str:
-    """Normalise a Z3 value token to a plain decimal string.
-
-    Z3 represents negative integers as (- N) rather than -N.
-    """
-    s = raw.strip()
-    m = re.match(r'^\(-\s*(\d+)\)?$', s)
-    if m:
-        return f"-{m.group(1)}"
-    return s
-
-
-def _parse_z3_model(output: str) -> dict[str, tuple[str, str]] | None:
-    """
-    Parse z3's stdout into {var_name: (sort, value_str)}.
-    Returns None when the result is not 'sat'.
-    """
-    lines = output.strip().splitlines()
-    if not lines or lines[0].strip() != "sat":
-        return None
-    model_text = "\n".join(lines[1:])
-    result: dict[str, tuple[str, str]] = {}
-    for m in _DEFINE_FUN_RE.finditer(model_text):
-        name = m.group(1)
-        sort = m.group(2).strip()
-        value = _z3_val_to_str(m.group(3))
-        result[name] = (sort, value)
-    return result
-
-
-def _blocking_clause(model: dict[str, tuple[str, str]], declared: set[str]) -> str:
-    """Build (assert (not (and (= v val) ...))) over declared variables only."""
-    equalities = [
-        f"(= {name} {value})"
-        for name, (_, value) in model.items()
-        if name in declared
-    ]
-    if not equalities:
-        return ""
-    body = equalities[0] if len(equalities) == 1 else f"(and {' '.join(equalities)})"
-    return f"(assert (not {body}))"
 
 
 def build_safe_math_source(fns_needed: set[tuple[str, int, bool]]) -> str:
-    """Generate safe_math.nr source — only abs functions are emitted."""
+    """Generate safe_math.nr source for safe_add/sub/mul/abs per type."""
     lines: list[str] = []
     for op_name, bits, signed in sorted(fns_needed):
-        if op_name != "abs":
-            continue
         type_str = f"{'i' if signed else 'u'}{bits}"
         fn_name = f"{op_name}_{type_str}"
-        if not signed:
-            lines += [
-                f"pub fn {fn_name}(a: {type_str}) -> {type_str} {{",
-                f"    a",
-                f"}}",
-                "",
-            ]
+        if op_name == "abs":
+            if not signed:
+                # Unsigned values are always non-negative; abs is the identity.
+                lines += [
+                    f"pub fn {fn_name}(a: {type_str}) -> {type_str} {{",
+                    f"    a",
+                    f"}}",
+                    "",
+                ]
+            else:
+                lines += [
+                    f"pub fn {fn_name}(a: {type_str}) -> {type_str} {{",
+                    f"    if a >= 0 {{ a }} else {{ -a }}",
+                    f"}}",
+                    "",
+                ]
         else:
+            noir_op = {"add": "+", "sub": "-", "mul": "*"}[op_name]
+            lo = -(2 ** (bits - 1)) if signed else 0
+            hi = (2 ** (bits - 1) - 1) if signed else (2 ** min(bits, 63)) - 1
             lines += [
-                f"pub fn {fn_name}(a: {type_str}) -> {type_str} {{",
-                f"    if a >= 0 {{ a }} else {{ -a }}",
+                f"pub fn {fn_name}(a: {type_str}, b: {type_str}) -> {type_str} {{",
+                f"    let c: {type_str} = a {noir_op} b;",
+                f"    assert(c >= {lo}, \"{fn_name}_lb\");",
+                f"    assert(c <= {hi}, \"{fn_name}_ub\");",
+                f"    c",
                 f"}}",
                 "",
             ]
     return "\n".join(lines)
 
 
-
-
-def _solver_cmd(solver: str) -> list[str]:
-    if solver == "cvc5":
-        return ["cvc5", "--produce-models", "--lang=smt2", "-"]
-    return ["z3", "-in"]
-
-
-def enumerate_models(
-    smt_content: str,
-    declared: set[str],
-    max_models: int,
-    timeout: int = 30,
-    circuit=None,
-    solver: str = "z3",
-) -> list[dict[str, tuple[str, str]]]:
-    """
-    Call the SMT solver repeatedly with blocking clauses to collect up to max_models
-    satisfying assignments, bounded by the type of every integer subexpression.
-    """
-    base = _strip_check_commands(smt_content)
-    bounds = build_type_bounds(circuit) if circuit is not None else []
-    extra: list[str] = bounds[:]
-    models: list[dict[str, tuple[str, str]]] = []
-
-    for _ in range(max_models):
-        query = base + "\n" + "\n".join(extra) + "\n(check-sat)\n(get-model)\n"
-        proc = subprocess.run(
-            _solver_cmd(solver),
-            input=query,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        # Raise on unexpected solver errors so they get saved to the errors directory.
-        # "model is not available" is expected when the solver proves UNSAT — not a real error.
-        _EXPECTED_SOLVER_ERRORS = (
-            "model is not available",          # Z3: UNSAT then get-model
-            "cannot get model unless after",   # cvc5: UNSAT then get-model
-        )
-        solver_errors = [
-            l for l in proc.stdout.splitlines()
-            if l.strip().startswith("(error")
-            and not any(e in l for e in _EXPECTED_SOLVER_ERRORS)
-        ]
-        if solver_errors:
-            raise RuntimeError(f"{solver} error: {solver_errors[0].strip()}")
-
-        model = _parse_z3_model(proc.stdout)
-        if model is None:
-            break
-        models.append(model)
-        clause = _blocking_clause(model, declared)
-        if not clause:
-            break
-        extra.append(clause)
-
-    return models
 
 
 # ---------------------------------------------------------------------------
@@ -867,16 +461,10 @@ def generate_smt(config: dict, timeout: int = 30) -> str:
 # Oracle helpers
 # ---------------------------------------------------------------------------
 
-def _boundary_values(t: IntegerType) -> list[int]:
-    """Return boundary integers for a given Noir integer type."""
-    lo, hi = _type_bounds(t)
-    candidates = [lo, lo + 1, -1, 0, 1, hi - 1, hi]
-    return sorted(set(v for v in candidates if lo <= v <= hi))
 
 
 def build_boundary_prover_toml(
     circuit,
-    int_type_map: dict[str, IntegerType],
     rng: random.Random,
     struct_map: dict[str, tuple[str, str]] | None = None,
     array_map: dict[str, tuple[str, int]] | None = None,
@@ -897,7 +485,7 @@ def build_boundary_prover_toml(
     def _bval(var) -> str:
         if var.variable_type == VariableType.BOOLEAN:
             return rng.choice(["true", "false"])
-        t = int_type_map.get(var.name, IntegerType(64, True))
+        t = var.noir_type if isinstance(var.noir_type, IntegerType) else IntegerType(64, True)
         lo, hi = _type_bounds(t)
         pool = sorted(set(v for v in [lo, lo+1, -1, 0, 1, hi-1, hi] if lo <= v <= hi))
         return str(rng.choice(pool))
@@ -1008,7 +596,6 @@ def find_sat_oracle_input(
     smt_content: str,
     circuit,
     model: dict,
-    int_type_map: dict[str, IntegerType],
 ) -> tuple[dict, str] | None:
     """
     Try minimal single-variable modifications that Z3 confirms make the formula UNSAT.
@@ -1036,7 +623,7 @@ def find_sat_oracle_input(
             current_val = int(raw)
         except ValueError:
             continue
-        t = int_type_map.get(var.name, IntegerType(64, True))
+        t = var.noir_type if isinstance(var.noir_type, IntegerType) else IntegerType(64, True)
         lo, hi = _type_bounds(t)
         for delta in _INT_FLIP_DELTAS:
             new_val = current_val + delta
@@ -1119,6 +706,13 @@ def main() -> None:
         default=10,
         metavar="N",
         help="Keep only the N most recent run directories, deleting older ones (default: 10).",
+    )
+    parser.add_argument(
+        "--cleanup-every",
+        type=int,
+        default=500,
+        metavar="N",
+        help="Delete out/ of the current run every N programs to free disk space (default: 500).",
     )
     args = parser.parse_args()
 
@@ -1221,7 +815,16 @@ def main() -> None:
                 yield f"gen-{idx:04d}", content
                 idx += 1
 
+    n_processed = 0
     for stem, smt_content in _iter_formulas():
+        if args.cleanup_every > 0 and n_processed > 0 and n_processed % args.cleanup_every == 0:
+            for sub in (sat_dir, unsat_dir, sat_to_unsat_dir):
+                if sub.exists():
+                    shutil.rmtree(sub, ignore_errors=True)
+                    sub.mkdir(parents=True, exist_ok=True)
+            print(f"[cleanup] cleared out/ after {n_processed} programs")
+        n_processed += 1
+
         smt_filename = f"{stem}.smt2"
         print(f"\n=== {stem} ===")
 
@@ -1241,13 +844,14 @@ def main() -> None:
         declared = {v.name for v in circuit.inputs}
         int_var_names = [v.name for v in circuit.inputs if v.variable_type == VariableType.INTEGER]
 
-        int_type_map: dict[str, IntegerType] = {}
+        recompute_types(circuit, smt_content, sample_int_type=gen_config.get("sample_int_type", True))
+        _type_bounds_clauses = build_type_bounds(circuit)
         if int_var_names:
-            int_type_map = assign_int_types(int_var_names, smt_content, circuit)
-            types_summary = ", ".join(f"{n}:{t}" for n, t in int_type_map.items())
+            types_summary = ", ".join(
+                f"{v.name}:{v.noir_type}"
+                for v in circuit.inputs if v.variable_type == VariableType.INTEGER
+            )
             print(f"  Types: {types_summary}")
-        const_type_rng = random.Random(int(hashlib.md5(smt_content.encode()).hexdigest(), 16) + 5)
-        recompute_types(circuit, int_type_map, rng=const_type_rng)
 
         if variables_bundling == "flat":
             struct_map, array_map, tuple_map, nesting_map = {}, {}, {}, {}
@@ -1264,7 +868,6 @@ def main() -> None:
         # 2. Circuit IR → Noir source
         try:
             visitor = IR2NoirVisitor(
-                int_type_map=int_type_map,
                 struct_map=struct_map,
                 array_map=array_map,
                 tuple_map=tuple_map,
@@ -1286,16 +889,6 @@ def main() -> None:
                 f"TRANSLATION ERROR: {exc}\n\n{traceback.format_exc()}"
             )
             continue
-
-        # Build the Z3 query for SAT model enumeration (saved alongside any SAT errors
-        # so they can be reproduced independently outside the fuzzer).
-        _type_bounds_clauses = build_type_bounds(circuit)
-        _z3_sat_query = (
-            _strip_check_commands(smt_content)
-            + "\n"
-            + "\n".join(_type_bounds_clauses)
-            + "\n(check-sat)\n(get-model)\n"
-        )
 
         # 3. Find a satisfying witness using the witness generator module.
         z3_failed_error: Exception | None = None
@@ -1326,7 +919,8 @@ def main() -> None:
         except FileNotFoundError as exc:
             sys.exit(f"Error: solver not found in PATH: {exc}")
         except Exception as exc:
-            label = "z3_then_cvc5" if solver == "z3_to_cvc5" else active_solver
+            # Both solvers failed (or single solver failed).
+            label = f"z3_then_cvc5" if solver == "z3_to_cvc5" else active_solver
             print(f"  ERROR ({label} error): {exc}")
             sat_error += 1
             dest = errors_dir / "smt_solver_errors" / f"obj.{stem}-{label}error"
@@ -1363,7 +957,7 @@ def main() -> None:
                 folder_name = f"obj.{stem}-{idx}"
                 pkg_name    = _sanitize_name(folder_name)
                 project_dir = unsat_dir / folder_name
-                boundary_toml = build_boundary_prover_toml(circuit, int_type_map, rng_unsat, struct_map, array_map, tuple_map, nesting_map, param_name_map)
+                boundary_toml = build_boundary_prover_toml(circuit, rng_unsat, struct_map, array_map, tuple_map, nesting_map, param_name_map)
                 create_noir_project(project_dir, noir_source, boundary_toml, pkg_name,
                                     smt_source=smt_content, smt_filename=smt_filename,
                                     safe_math_source=safe_math_src, z3_query=_z3_unsat_query)
@@ -1432,8 +1026,7 @@ def main() -> None:
                 sat_ok += 1
 
                 # SAT oracle: find a minimal UNSAT modification and assert nargo rejects it.
-                oracle_result = find_sat_oracle_input(
-                    smt_content, circuit, model, int_type_map)
+                oracle_result = find_sat_oracle_input(smt_content, circuit, model)
                 if oracle_result is not None:
                     oracle_model, oracle_z3_query = oracle_result
                     oracle_toml = model_to_prover_toml(oracle_model, circuit, struct_map, array_map, tuple_map, nesting_map, param_name_map)

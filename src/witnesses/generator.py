@@ -3,99 +3,12 @@ Witness generation: given an SMT formula and its Circuit IR, find a satisfying
 variable assignment bounded to the circuit's Noir types.
 """
 
-import hashlib
-import random
 import re
 import subprocess
-from pathlib import Path
 
-from src.ir.nodes import Circuit, VariableType
-from src.backends.noir.ir2noir import recompute_types, _UNSIGNED_NEG_PROMOTION
-from src.backends.noir.types import IntegerType, BoolType
-
-
-# ---------------------------------------------------------------------------
-# Integer type pool and bounds
-# ---------------------------------------------------------------------------
-
-_INT_TYPE_POOL = [
-    IntegerType(8,  True),   # i8
-    IntegerType(16, True),   # i16
-    IntegerType(32, True),   # i32
-    IntegerType(64, True),   # i64
-    IntegerType(8,  False),  # u8
-    IntegerType(16, False),  # u16
-    IntegerType(32, False),  # u32
-    IntegerType(64, False),  # u64  (capped at i64 max for safe negation)
-]
-
-
-def type_bounds(t: IntegerType) -> tuple[int, int]:
-    """Return the (lo, hi) Z3 integer bounds for a Noir integer type."""
-    if t.signed:
-        return -(2 ** (t.bits - 1)), (2 ** (t.bits - 1)) - 1
-    else:
-        return 0, (2 ** min(t.bits, 63)) - 1
-
-
-# ---------------------------------------------------------------------------
-# Type assignment
-# ---------------------------------------------------------------------------
-
-def _collect_var_const_ranges(circuit: Circuit) -> dict[str, tuple[int, int]]:
-    """For each integer variable, find the min/max constants it's directly compared with."""
-    from src.ir.nodes import BinaryExpression, Variable, Integer, Operator
-    ranges: dict[str, tuple[int, int]] = {}
-
-    def _update(name: str, val: int) -> None:
-        lo, hi = ranges.get(name, (0, 0))
-        ranges[name] = (min(lo, val), max(hi, val))
-
-    def _walk(node) -> None:
-        from src.ir.nodes import UnaryExpression, TernaryExpression, Assertion, Assume, Assignment
-        if isinstance(node, BinaryExpression):
-            if node.op in (Operator.ADD, Operator.SUB, Operator.EQU, Operator.NEQ,
-                           Operator.LTH, Operator.LEQ, Operator.GTH, Operator.GEQ):
-                if isinstance(node.lhs, Variable) and isinstance(node.rhs, Integer):
-                    _update(node.lhs.name, node.rhs.value)
-                if isinstance(node.rhs, Variable) and isinstance(node.lhs, Integer):
-                    _update(node.rhs.name, node.lhs.value)
-            _walk(node.lhs); _walk(node.rhs)
-        elif isinstance(node, UnaryExpression):
-            _walk(node.value)
-        elif isinstance(node, TernaryExpression):
-            _walk(node.condition); _walk(node.if_expr); _walk(node.else_expr)
-        elif isinstance(node, Assertion):
-            _walk(node.value)
-        elif isinstance(node, Assume):
-            _walk(node.condition)
-        elif isinstance(node, Assignment):
-            _walk(node.rhs)
-
-    for stmt in circuit.statements:
-        _walk(stmt)
-    return ranges
-
-
-def assign_int_types(
-    int_var_names: list[str],
-    smt_content: str,
-    circuit: Circuit,
-) -> dict[str, IntegerType]:
-    """Deterministically assign a Noir integer type to each integer variable."""
-    seed = int(hashlib.md5(smt_content.encode()).hexdigest(), 16)
-    rng = random.Random(seed)
-    const_ranges = _collect_var_const_ranges(circuit)
-
-    result: dict[str, IntegerType] = {}
-    for name in int_var_names:
-        min_c, max_c = const_ranges.get(name, (0, 0))
-        valid = [
-            t for t in _INT_TYPE_POOL
-            if type_bounds(t)[0] <= min_c and type_bounds(t)[1] >= max_c
-        ]
-        result[name] = rng.choice(valid) if valid else IntegerType(64, True)
-    return result
+from src.ir.nodes import Circuit
+from src.backends.noir.ir2noir import recompute_types, _type_bounds
+from src.backends.noir.types import IntegerType
 
 
 # ---------------------------------------------------------------------------
@@ -140,10 +53,12 @@ def build_type_bounds(circuit: Circuit) -> list[str]:
     (assert (>= expr MIN)) and (assert (<= expr MAX)).
     Requires recompute_types() to have been called first.
     """
-    from src.ir.nodes import (Expression, BinaryExpression, UnaryExpression,
-                               TernaryExpression, Assertion, Assume, Assignment)
-    clauses: list[str] = []
-    seen: set[str] = set()
+    from src.ir.nodes import (Expression, Integer as IRInteger, BinaryExpression,
+                               UnaryExpression, TernaryExpression, Assertion, Assume, Assignment)
+    # Track tightest (lo, hi) seen per unique SMT string across all occurrences.
+    # The same expression can appear many times with different noir_types (because
+    # constants get independently random types), so we take max(lo) and min(hi).
+    tightest: dict[str, tuple[int, int]] = {}
 
     def _walk(node) -> None:
         if isinstance(node, BinaryExpression):
@@ -155,19 +70,20 @@ def build_type_bounds(circuit: Circuit) -> list[str]:
 
         if not isinstance(node, Expression):
             return
-        from src.ir.nodes import Integer as IRInteger_
-        if isinstance(node, IRInteger_):
+        if isinstance(node, IRInteger):
             return  # constants are always within their own range by construction
         t = node.noir_type
         if not isinstance(t, IntegerType):
             return
         smt_str = _expr_to_smt(node)
-        if smt_str is None or smt_str in seen:
+        if smt_str is None:
             return
-        seen.add(smt_str)
-        lo, hi = type_bounds(t)
-        clauses.append(f"(assert (>= {smt_str} {lo}))")
-        clauses.append(f"(assert (<= {smt_str} {hi}))")
+        lo, hi = _type_bounds(t)
+        if smt_str in tightest:
+            old_lo, old_hi = tightest[smt_str]
+            tightest[smt_str] = (max(old_lo, lo), min(old_hi, hi))
+        else:
+            tightest[smt_str] = (lo, hi)
 
     for stmt in circuit.statements:
         if isinstance(stmt, Assertion):
@@ -176,6 +92,11 @@ def build_type_bounds(circuit: Circuit) -> list[str]:
             _walk(stmt.condition)
         elif isinstance(stmt, Assignment):
             _walk(stmt.rhs)
+
+    clauses: list[str] = []
+    for smt_str, (lo, hi) in tightest.items():
+        clauses.append(f"(assert (>= {smt_str} {lo}))")
+        clauses.append(f"(assert (<= {smt_str} {hi}))")
     return clauses
 
 
@@ -206,6 +127,16 @@ def _parse_z3_model(output: str) -> dict[str, tuple[str, str]] | None:
     return result
 
 
+def _strip_check_commands(smt: str) -> str:
+    out = []
+    for line in smt.splitlines():
+        s = line.strip()
+        if s.startswith(("(check-sat", "(get-model", "(get-value", "(exit")):
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -223,13 +154,13 @@ def find_witness(
     Returns (model, z3_query) where model is the raw Z3 model dict (or None
     if UNSAT/timeout) and z3_query is the full augmented query that was sent.
     """
-    int_var_names = [v.name for v in circuit.inputs if v.variable_type == VariableType.INTEGER]
-    int_type_map = assign_int_types(int_var_names, smt_content, circuit) if int_var_names else {}
-    const_type_rng = random.Random(int(hashlib.md5(smt_content.encode()).hexdigest(), 16) + 5)
-    recompute_types(circuit, int_type_map, rng=const_type_rng)
+    recompute_types(circuit, smt_content)
 
     bounds = build_type_bounds(circuit)
     base = _strip_check_commands(smt_content)
+    # Upgrade to NIA so nonlinear type-bound expressions (e.g. products of constants
+    # with variables) are accepted without errors.
+    base = re.sub(r'\(set-logic\s+QF_LIA\b', '(set-logic QF_NIA', base)
     query = base + "\n" + "\n".join(bounds) + "\n(check-sat)\n(get-model)\n"
 
     cmd = ["cvc5", "--produce-models", "--lang=smt2", "-"] if solver == "cvc5" else ["z3", "-in"]
@@ -239,13 +170,3 @@ def find_witness(
         return None, query
 
     return _parse_z3_model(proc.stdout), query
-
-
-def _strip_check_commands(smt: str) -> str:
-    out = []
-    for line in smt.splitlines():
-        s = line.strip()
-        if s.startswith(("(check-sat", "(get-model", "(get-value", "(exit")):
-            continue
-        out.append(line)
-    return "\n".join(out)

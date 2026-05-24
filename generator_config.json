@@ -2,5 +2,6 @@
   "variables_bundling": "simple",
   "solver": "z3_to_cvc5",
   "solver_timeout": 15,
-  "nargo_timeout": 30
+  "nargo_timeout": 30,
+  "sample_int_type": true
 }

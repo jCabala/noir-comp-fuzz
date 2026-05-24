@@ -68,26 +68,86 @@ _INT_TYPE_POOL = [
 def _type_bounds(t: IntegerType) -> tuple[int, int]:
     if t.signed:
         return -(2 ** (t.bits - 1)), (2 ** (t.bits - 1)) - 1
-    return 0, (2 ** min(t.bits, 63)) - 1
+    # Cap unsigned upper bound at the signed companion max (2^(bits-1)-1) so that
+    # any uN value is safely castable to iN without wrapping.
+    return 0, (2 ** (t.bits - 1)) - 1
 
 
-def _pick_const_type(val: int, rng: random.Random) -> IntegerType:
+def _pick_const_type(val: int, rng: random.Random, sample: bool = True) -> IntegerType:
     """Pick a random Noir type that can hold val. Negative values require signed types."""
+    if not sample:
+        return IntegerType(64, True)
     valid = [t for t in _INT_TYPE_POOL
              if (t.signed or val >= 0) and _type_bounds(t)[0] <= val <= _type_bounds(t)[1]]
     return rng.choice(valid) if valid else IntegerType(64, True)
 
 
-def recompute_types(
-    circuit: IRNodes.Circuit,
-    int_type_map: dict[str, IntegerType],
-    rng: random.Random | None = None,
-) -> None:
-    """Walk every expression in the circuit bottom-up and set expr.noir_type.
-    If rng is provided, integer literals get randomly chosen types (not just i64)."""
+def _collect_var_const_ranges(circuit: IRNodes.Circuit) -> dict[str, tuple[int, int]]:
+    """For each integer variable, find the min/max constants it's directly paired with."""
+    ranges: dict[str, tuple[int, int]] = {}
+
+    def _update(name: str, val: int) -> None:
+        lo, hi = ranges.get(name, (0, 0))
+        ranges[name] = (min(lo, val), max(hi, val))
+
+    def _walk(node) -> None:
+        if isinstance(node, IRNodes.BinaryExpression):
+            if isinstance(node.lhs, IRNodes.Variable) and node.lhs.variable_type == IRNodes.VariableType.INTEGER \
+                    and isinstance(node.rhs, IRNodes.Integer):
+                _update(node.lhs.name, node.rhs.value)
+            if isinstance(node.rhs, IRNodes.Variable) and node.rhs.variable_type == IRNodes.VariableType.INTEGER \
+                    and isinstance(node.lhs, IRNodes.Integer):
+                _update(node.rhs.name, node.lhs.value)
+            _walk(node.lhs); _walk(node.rhs)
+        elif isinstance(node, IRNodes.UnaryExpression):
+            _walk(node.value)
+        elif isinstance(node, IRNodes.TernaryExpression):
+            _walk(node.condition); _walk(node.if_expr); _walk(node.else_expr)
+        elif isinstance(node, IRNodes.Assertion):
+            _walk(node.value)
+        elif isinstance(node, IRNodes.Assume):
+            _walk(node.condition)
+        elif isinstance(node, IRNodes.Assignment):
+            _walk(node.rhs)
+
+    for stmt in circuit.statements:
+        _walk(stmt)
+    return ranges
+
+
+def _pick_var_type(name: str, const_ranges: dict, rng: random.Random, sample: bool = True) -> IntegerType:
+    if not sample:
+        return IntegerType(64, True)
+    min_c, max_c = const_ranges.get(name, (0, 0))
+    valid = [t for t in _INT_TYPE_POOL
+             if _type_bounds(t)[0] <= min_c and _type_bounds(t)[1] >= max_c]
+    return rng.choice(valid) if valid else IntegerType(64, True)
+
+
+def recompute_types(circuit: IRNodes.Circuit, smt_content: str, sample_int_type: bool = True) -> None:
+    """Assign Noir types to every expression in the circuit and store on expr.noir_type.
+
+    Variable types are randomly assigned (seeded from smt_content) filtered by the
+    constants they appear alongside. Integer literal types are also randomly chosen.
+    All other expression types are propagated bottom-up.
+    If sample_int_type is False, all integer variables and constants are forced to i64.
+    """
+    import hashlib as _hashlib
+    seed = int(_hashlib.md5(smt_content.encode()).hexdigest(), 16)
+    var_rng   = random.Random(seed)        # for input variable type assignment
+    const_rng = random.Random(seed + 5)   # for integer literal type assignment
+
+    const_ranges = _collect_var_const_ranges(circuit)
+
+    # Pre-assign one type per variable name using circuit.inputs (one entry per name).
+    # This ensures all occurrences of the same variable get the same type.
+    var_type_map: dict[str, IntegerType] = {}
+    for inp in circuit.inputs:
+        if inp.variable_type == IRNodes.VariableType.INTEGER:
+            var_type_map[inp.name] = _pick_var_type(inp.name, const_ranges, var_rng, sample_int_type)
 
     def _walk(expr: IRNodes.Expression) -> NoirType:
-        # Post-order: set children first, then this node.
+        # Post-order: children first.
         if isinstance(expr, IRNodes.UnaryExpression):
             _walk(expr.value)
         elif isinstance(expr, IRNodes.BinaryExpression):
@@ -97,11 +157,11 @@ def recompute_types(
 
         if isinstance(expr, IRNodes.Variable):
             if expr.variable_type == IRNodes.VariableType.INTEGER:
-                t: NoirType = int_type_map.get(expr.name, IntegerType(64, True))
+                t: NoirType = var_type_map.get(expr.name, IntegerType(64, True))
             else:
                 t = BoolType()
         elif isinstance(expr, IRNodes.Integer):
-            t = _pick_const_type(expr.value, rng) if rng is not None else IntegerType(64, True)
+            t = _pick_const_type(expr.value, const_rng, sample_int_type)
         elif isinstance(expr, IRNodes.Boolean):
             t = BoolType()
         elif isinstance(expr, IRNodes.UnaryExpression):
@@ -127,6 +187,14 @@ def recompute_types(
                     t = rt
                 else:
                     t = BoolType()
+                # For constant-only expressions, widen only if t cannot hold the folded value.
+                if isinstance(t, IntegerType):
+                    folded = _fold_expr_constant(expr)
+                    if folded is not None and not (_type_bounds(t)[0] <= folded <= _type_bounds(t)[1]):
+                        valid = [tp for tp in _INT_TYPE_POOL
+                                 if _type_bounds(tp)[0] <= folded <= _type_bounds(tp)[1]]
+                        if valid:
+                            t = _common_int_type(t, min(valid, key=lambda tp: tp.bits))
         elif isinstance(expr, IRNodes.TernaryExpression):
             lt, rt = expr.if_expr.noir_type, expr.else_expr.noir_type
             if isinstance(lt, IntegerType) and isinstance(rt, IntegerType):
@@ -178,7 +246,6 @@ class NameDispenser:
 class IR2NoirVisitor:
     def __init__(
         self,
-        int_type_map: dict[str, IntegerType] | None = None,
         struct_map: dict[str, tuple[str, str]] | None = None,
         array_map: dict[str, tuple[str, int]] | None = None,
         tuple_map: dict[str, tuple[str, int]] | None = None,
@@ -186,9 +253,8 @@ class IR2NoirVisitor:
         rng: random.Random | None = None,
     ):
         self._name_dispenser = NameDispenser()
-        self._int_type_map: dict[str, IntegerType] = int_type_map or {}
         # Cache: emitted-expression-string → Identifier for deduplication of mid_N vars.
-        self._mid_cache: dict[str, Identifier] = {}
+        self._mid_cache: dict[str, tuple[Identifier, NoirType]] = {}
         # Populated by visit_circuit: maps original param name → actual Noir param name
         # (may add '_' prefix for unused params).
         self.param_name_map: dict[str, str] = {}
@@ -347,11 +413,17 @@ class IR2NoirVisitor:
 
         lt = self._expr_type(node.lhs)
         rt = self._expr_type(node.rhs)
+        node_type = self._infer_type(node)
 
         # Insert casts for type-differing integer operands.
+        # Also incorporate node_type so that when constant-folding widened the result
+        # to a signed type (e.g., u32 operands but result folds to -28 → i32), we use
+        # signed arithmetic instead of unsigned (which would panic on underflow).
         common: IntegerType | None = None
-        if isinstance(lt, IntegerType) and isinstance(rt, IntegerType) and lt != rt:
+        if isinstance(lt, IntegerType) and isinstance(rt, IntegerType):
             common = _common_int_type(lt, rt)
+            if isinstance(node_type, IntegerType):
+                common = _common_int_type(common, node_type)
             if lt != common:
                 lhs = CastExpression(lhs, common)
             if rt != common:
@@ -361,7 +433,13 @@ class IR2NoirVisitor:
         elif rt is not None:
             common = rt
 
-        return self._maybe_intermediate(node, BinaryExpression(op, lhs, rhs), statements)
+        final_expr: Expression = BinaryExpression(op, lhs, rhs)
+        # If operands were promoted to a wider type (e.g., u32→i64 for signed arithmetic),
+        # cast the result back to node_type so the let binding type matches.
+        if isinstance(common, IntegerType) and isinstance(node_type, IntegerType) and common != node_type:
+            final_expr = CastExpression(final_expr, node_type)
+
+        return self._maybe_intermediate(node, final_expr, statements)
 
     @staticmethod
     def _expr_to_str(expr: Expression) -> str:
@@ -387,11 +465,16 @@ class IR2NoirVisitor:
                 and self._rng.random() < 0.3):
             key = self._expr_to_str(noir_expr)
             if key in self._mid_cache:
-                return self._mid_cache[key].copy(), stmts  # reuse existing mid_N
+                cached_id, cached_type = self._mid_cache[key]
+                result: Expression = cached_id.copy()
+                current_type = self._infer_type(ir_node)
+                if isinstance(cached_type, IntegerType) and isinstance(current_type, IntegerType) and cached_type != current_type:
+                    result = CastExpression(result, current_type)
+                return result, stmts
             mid_name = self._name_dispenser.next("mid")
             mid_type = self._infer_type(ir_node)
             stmts.append(LetStatement(mid_name.copy(), noir_expr, mid_type))
-            self._mid_cache[key] = mid_name.copy()
+            self._mid_cache[key] = (mid_name.copy(), mid_type)
             return mid_name, stmts
         return noir_expr, stmts
 
@@ -525,7 +608,7 @@ class IR2NoirVisitor:
             statements += self.visit_statement(stmt)
 
         helper_fns: list[FunctionDefinition] = []
-        flat_visitor = IR2NoirVisitor(int_type_map=self._int_type_map, rng=self._rng)
+        flat_visitor = IR2NoirVisitor(rng=self._rng)
         # Share the parent's name dispenser and global defs so:
         #  - generated names (K_N, tmp_N) are globally unique across main + helpers
         #  - globals extracted inside helpers end up in the Document
@@ -598,9 +681,8 @@ class IR2NoirVisitor:
         # --- Type aliases: randomly alias integer types used in this circuit ---
         used_int_types: dict[str, IntegerType] = {}
         for inp in node.inputs:
-            if inp.variable_type == IRNodes.VariableType.INTEGER:
-                t = self._int_type_map.get(inp.name, IntegerType(64, True))
-                used_int_types[str(t)] = t
+            if inp.variable_type == IRNodes.VariableType.INTEGER and isinstance(inp.noir_type, IntegerType):
+                used_int_types[str(inp.noir_type)] = inp.noir_type
         alias_counter = 0
         for type_str, base_type in sorted(used_int_types.items()):
             if self._rng and self._rng.choice([True, False]):
@@ -780,7 +862,7 @@ class IR2NoirVisitor:
         # Helper metadata: {group_name: (helper_fn, call_args_from_main_perspective)}
         # We process in reverse so we can expand parent params.
         # group_helpers already initialised before the first pass.
-        flat_visitor = IR2NoirVisitor(int_type_map=self._int_type_map, rng=self._rng)
+        flat_visitor = IR2NoirVisitor(rng=self._rng)
         # Share the parent's name dispenser and global defs so:
         #  - generated names (K_N, tmp_N) are globally unique across main + helpers
         #  - globals extracted inside helpers end up in the Document
@@ -925,7 +1007,7 @@ class IR2NoirVisitor:
         if var.variable_type == IRNodes.VariableType.BOOLEAN:
             return BoolType()
         if var.variable_type == IRNodes.VariableType.INTEGER:
-            base = self._int_type_map.get(var.name, IntegerType(64, True))
+            base = var.noir_type if isinstance(var.noir_type, IntegerType) else IntegerType(64, True)
             alias = self._type_alias_map.get(str(base))
             return AliasType(alias) if alias else base
         return FieldType()
