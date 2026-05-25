@@ -714,6 +714,13 @@ def main() -> None:
         metavar="N",
         help="Delete out/ of the current run every N programs to free disk space (default: 500).",
     )
+    parser.add_argument(
+        "--max-noir-lines",
+        type=int,
+        default=20000,
+        metavar="N",
+        help="Skip programs whose generated main.nr exceeds N lines to avoid OOM (default: 20000).",
+    )
     args = parser.parse_args()
 
     gen_config: dict = {}
@@ -888,6 +895,14 @@ def main() -> None:
             (dest / "nargo_output.txt").write_text(
                 f"TRANSLATION ERROR: {exc}\n\n{traceback.format_exc()}"
             )
+            continue
+
+        # Guard against programs so large they would OOM the compiler.
+        noir_lines = noir_source.count("\n")
+        if args.max_noir_lines > 0 and noir_lines > args.max_noir_lines:
+            print(f"  [{stem}] SKIP (main.nr too large: {noir_lines} lines > {args.max_noir_lines})")
+            skipped += 1
+            n_processed += 1
             continue
 
         # 3. Find a satisfying witness using the witness generator module.

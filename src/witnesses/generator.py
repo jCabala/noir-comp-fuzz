@@ -11,6 +11,23 @@ from src.backends.noir.ir2noir import recompute_types, _type_bounds
 from src.backends.noir.types import IntegerType
 
 
+def _expr_type_bounds(t: IntegerType, is_variable: bool) -> tuple[int, int]:
+    """
+    Return (lo, hi) bounds for Z3.
+
+    For input variables we apply the signed-companion cap (u8 → 0..127, etc.)
+    so that a cast 'var as iN' is guaranteed not to wrap.  For intermediate
+    expression results we use the real type range (u8 → 0..255) because the
+    expression itself is computed at that type and wrapping in a later cast
+    is handled by the parent expression's own bounds.
+    """
+    if is_variable:
+        return _type_bounds(t)          # signed-companion cap for variables
+    if t.signed:
+        return -(2 ** (t.bits - 1)), (2 ** (t.bits - 1)) - 1
+    return 0, (2 ** t.bits) - 1        # full unsigned range for expressions
+
+
 # ---------------------------------------------------------------------------
 # Expression → SMT string
 # ---------------------------------------------------------------------------
@@ -53,12 +70,22 @@ def build_type_bounds(circuit: Circuit) -> list[str]:
     (assert (>= expr MIN)) and (assert (<= expr MAX)).
     Requires recompute_types() to have been called first.
     """
-    from src.ir.nodes import (Expression, Integer as IRInteger, BinaryExpression,
-                               UnaryExpression, TernaryExpression, Assertion, Assume, Assignment)
-    # Track tightest (lo, hi) seen per unique SMT string across all occurrences.
-    # The same expression can appear many times with different noir_types (because
-    # constants get independently random types), so we take max(lo) and min(hi).
-    tightest: dict[str, tuple[int, int]] = {}
+    from src.ir.nodes import (Expression, Integer as IRInteger, Variable as IRVariable,
+                               BinaryExpression, UnaryExpression, TernaryExpression,
+                               Assertion, Assume, Assignment)
+    # For each unique SMT expression string, collect the tightest (lo, hi) across
+    # all occurrences (intersection of ranges).
+    #
+    # Two subtleties:
+    # - Variables get the signed-companion-capped range so that 'var as iN'
+    #   casts are always safe.  Expressions get the actual type range (e.g. u8 →
+    #   0..255, not 0..127) because arithmetic within an unsigned type is fine up
+    #   to the full unsigned max; wrapping via later casts is handled by the
+    #   parent expression's own bounds.
+    # - Taking the tightest (intersection) means Z3 only finds values that are
+    #   valid for *every* occurrence of the same expression, preventing overflow
+    #   in any typed context.
+    bounds_map: dict[str, tuple[int, int]] = {}
 
     def _walk(node) -> None:
         if isinstance(node, BinaryExpression):
@@ -78,12 +105,14 @@ def build_type_bounds(circuit: Circuit) -> list[str]:
         smt_str = _expr_to_smt(node)
         if smt_str is None:
             return
-        lo, hi = _type_bounds(t)
-        if smt_str in tightest:
-            old_lo, old_hi = tightest[smt_str]
-            tightest[smt_str] = (max(old_lo, lo), min(old_hi, hi))
+        is_var = isinstance(node, IRVariable)
+        lo, hi = _expr_type_bounds(t, is_var)
+        if smt_str in bounds_map:
+            old_lo, old_hi = bounds_map[smt_str]
+            # Tightest: take intersection across all occurrences.
+            bounds_map[smt_str] = (max(old_lo, lo), min(old_hi, hi))
         else:
-            tightest[smt_str] = (lo, hi)
+            bounds_map[smt_str] = (lo, hi)
 
     for stmt in circuit.statements:
         if isinstance(stmt, Assertion):
@@ -94,7 +123,7 @@ def build_type_bounds(circuit: Circuit) -> list[str]:
             _walk(stmt.rhs)
 
     clauses: list[str] = []
-    for smt_str, (lo, hi) in tightest.items():
+    for smt_str, (lo, hi) in bounds_map.items():
         clauses.append(f"(assert (>= {smt_str} {lo}))")
         clauses.append(f"(assert (<= {smt_str} {hi}))")
     return clauses
