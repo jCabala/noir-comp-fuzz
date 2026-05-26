@@ -39,7 +39,7 @@ def _expr_to_smt(expr) -> str | None:
     if isinstance(expr, Integer):
         return f"(- {abs(expr.value)})" if expr.value < 0 else str(expr.value)
     if isinstance(expr, Variable):
-        return expr.name if expr.variable_type == VariableType.INTEGER else None
+        return expr.name if expr.variable_type in (VariableType.INTEGER, VariableType.BOOLEAN) else None
     if isinstance(expr, UnaryExpression) and expr.op == Operator.SUB:
         inner = _expr_to_smt(expr.value)
         return f"(- {inner})" if inner is not None else None
@@ -99,6 +99,28 @@ def build_type_bounds(circuit: Circuit) -> list[str]:
             return
         if isinstance(node, IRInteger):
             return  # constants are always within their own range by construction
+
+        # When a BinaryExpression has mixed-type operands, ir2noir will cast the
+        # narrower/differently-signed operand to the common type.  Tighten the
+        # operand's bound to the common type's range so Z3 cannot pick a value
+        # that changes meaning after the cast (e.g. u64 product >= 2^63 becoming
+        # negative when reinterpreted as i64).  This must run for all BinaryExpression
+        # nodes including Bool comparisons, before the early return on non-integer types.
+        if isinstance(node, BinaryExpression):
+            from src.backends.noir.ir2noir import _common_int_type
+            lt, rt = node.lhs.noir_type, node.rhs.noir_type
+            if isinstance(lt, IntegerType) and isinstance(rt, IntegerType) and lt != rt:
+                common = _common_int_type(lt, rt)
+                for operand in (node.lhs, node.rhs):
+                    if operand.noir_type == common:
+                        continue
+                    op_smt = _expr_to_smt(operand)
+                    if op_smt is None or op_smt not in bounds_map:
+                        continue
+                    c_lo, c_hi = _type_bounds(common)
+                    old_lo, old_hi = bounds_map[op_smt]
+                    bounds_map[op_smt] = (max(old_lo, c_lo), min(old_hi, c_hi))
+
         t = node.noir_type
         if not isinstance(t, IntegerType):
             return

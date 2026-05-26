@@ -283,18 +283,31 @@ def save_error(
     z3_query: str = "",
 ) -> None:
     dest = errors_dir / category / folder_name
-    create_noir_project(dest, noir_source, prover_toml, package_name,
+    tmp = dest.parent / (folder_name + ".__tmp__")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    create_noir_project(tmp, noir_source, prover_toml, package_name,
                         smt_source=smt_content, smt_filename=smt_filename,
                         safe_math_source=safe_math_source, z3_query=z3_query)
-    (dest / "nargo_output.txt").write_text(nargo_output)
+    (tmp / "nargo_output.txt").write_text(nargo_output)
+    if dest.exists():
+        shutil.rmtree(dest)
+    tmp.rename(dest)
 
 
 def _is_assertion_failure(output: str) -> bool:
-    """Return True only when nargo rejected a witness via circuit assertions.
-    A compilation/linking failure (missing module, type error, etc.) is NOT
-    a meaningful oracle rejection and must not be counted as one."""
+    """Return True when nargo correctly rejected a witness — via runtime assertion
+    failure, static always-false detection, or backend constraint unsatisfiability.
+    Compilation/linking failures (missing module, type error, etc.) are NOT valid
+    oracle rejections and must not be counted as one."""
     lower = output.lower()
-    return "assertion failed" in lower or "failed assertion" in lower
+    return (
+        "assertion failed" in lower
+        or "failed assertion" in lower
+        or "assertion is always false" in lower        # nargo static analysis
+        or "cannot satisfy constraint" in lower        # bb backend constraint failure
+        or "failed constraint" in lower                # bb backend constraint failure
+    )
 
 
 def run_nargo_execute(project_dir: Path, timeout: int = 120) -> tuple[bool, str]:
@@ -639,6 +652,22 @@ def find_sat_oracle_input(
     return None
 
 
+_STATS_INTERVAL = 100
+
+
+def _write_recent_stats(path: Path, stats: dict, start: int, end: int) -> None:
+    lines = [
+        f"Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Iterations: {start}-{end}",
+        "",
+        f"sat         : {stats.get('sat_ok',0)} ok  |  {stats.get('sat_error',0)} error  |  {stats.get('sat_overflow',0)} overflow",
+        f"unsat       : {stats.get('unsat_ok',0)} ok  |  {stats.get('unsat_error',0)} bug  |  {stats.get('unsat_pipeline_error',0)} pipeline",
+        f"sat_to_unsat: {stats.get('oracle_ok',0)} ok  |  {stats.get('oracle_bug',0)} bug  |  {stats.get('oracle_skip',0)} no-flip  |  {stats.get('oracle_pipeline_error',0)} pipeline",
+        f"timeout     : {stats.get('n_timeout',0)}",
+    ]
+    path.write_text("\n".join(lines) + "\n")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -806,6 +835,10 @@ def main() -> None:
     oracle_ok = oracle_bug = oracle_skip = oracle_pipeline_error = 0
     n_timeout = skipped = 0
 
+    recent_stats_path = run_dir / "recent_stats.txt"
+    _window_snap: dict[str, int] = {}
+    _window_start = 1
+
     def _iter_formulas():
         """Yield (stem, smt_content) for either folder or generate mode."""
         if not generate_mode:
@@ -830,6 +863,19 @@ def main() -> None:
                     shutil.rmtree(sub, ignore_errors=True)
                     sub.mkdir(parents=True, exist_ok=True)
             print(f"[cleanup] cleared out/ after {n_processed} programs")
+        if n_processed > 0 and n_processed % _STATS_INTERVAL == 0:
+            _current = {
+                "sat_ok": sat_ok, "sat_error": sat_error, "sat_overflow": sat_overflow,
+                "unsat_ok": unsat_ok, "unsat_error": unsat_error,
+                "unsat_pipeline_error": unsat_pipeline_error,
+                "oracle_ok": oracle_ok, "oracle_bug": oracle_bug,
+                "oracle_skip": oracle_skip, "oracle_pipeline_error": oracle_pipeline_error,
+                "n_timeout": n_timeout,
+            }
+            _delta = {k: _current[k] - _window_snap.get(k, 0) for k in _current}
+            _write_recent_stats(recent_stats_path, _delta, _window_start, n_processed)
+            _window_snap = _current
+            _window_start = n_processed + 1
         n_processed += 1
 
         smt_filename = f"{stem}.smt2"

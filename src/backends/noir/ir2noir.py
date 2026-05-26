@@ -365,6 +365,9 @@ class IR2NoirVisitor:
         return BooleanLiteral(node.value), []
 
     def visit_integer(self, node: IRNodes.Integer) -> tuple[Expression, list[Statement]]:
+        t = self._expr_type(node)
+        if isinstance(t, IntegerType):
+            return CastExpression(IntegerLiteral(node.value), t), []
         return IntegerLiteral(node.value), []
 
     def _expr_type(self, expr: IRNodes.Expression) -> NoirType:

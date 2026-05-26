@@ -92,6 +92,17 @@ class EmitVisitor:
         self.buffer.write(f"\"{node.value}\"")
 
     def visit_cast_expression(self, node: CastExpression):
+        # Collapse double-cast of a literal: ((N as T1) as T2) → (N as T2).
+        # This arises when visit_integer wraps a constant in CastExpression and
+        # visit_binary_expression then promotes it to a wider common type.
+        inner = node.expr
+        if isinstance(inner, CastExpression) and isinstance(inner.expr, IntegerLiteral):
+            val = inner.expr.value
+            if val < 0:
+                self.buffer.write(f"({val}_{node.type_})")
+            else:
+                self.buffer.write(f"({val} as {node.type_})")
+            return
         # (-N as iX) is parsed by Noir as (field_elem(p-N) as iX) → wrong value.
         # Use the suffixed literal form -N_iX instead.
         if isinstance(node.expr, IntegerLiteral) and node.expr.value < 0:
