@@ -247,10 +247,11 @@ class FieldAccess(Expression):
 @dataclass
 class ArrayIndexExpression(Expression):
     array: Expression
-    index: int
+    index: "int | Expression"
 
     def copy(self) -> "ArrayIndexExpression":
-        return ArrayIndexExpression(self.array.copy(), self.index)
+        idx_copy = self.index.copy() if isinstance(self.index, ASTNode) else self.index
+        return ArrayIndexExpression(self.array.copy(), idx_copy)
 
 
 @dataclass

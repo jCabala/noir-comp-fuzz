@@ -12,6 +12,8 @@ from src.ir.nodes import (
     UnaryExpression,
     BinaryExpression,
     TernaryExpression,
+    SelectExpression,
+    StoreExpression,
     Operator,
     VariableType,
 )
@@ -339,6 +341,21 @@ def parse_smtlib2_ff(smtlib2: str) -> Circuit:
     )
 
 
+def _is_supported_array_sort(sort) -> bool:
+    """Return True for supported array sorts:
+    - (Array Int  X)  — Int-indexed, any supported value sort
+    - (Array Bool X)  — Bool-indexed, treated as a 2-element array (false→0, true→1)
+    Array-as-index (e.g. (Array (Array ...) ...)) is not supported."""
+    if not isinstance(sort, list) or len(sort) != 3 or sort[0] != "Array":
+        return False
+    if sort[1] not in ("Int", "Bool"):
+        return False
+    val = sort[2]
+    if val in ("Int", "Bool"):
+        return True
+    return _is_supported_array_sort(val)
+
+
 def parse_smtlib2_lia(smtlib2: str) -> Circuit:
     """
     Parse a QF_LIA (quantifier-free linear integer arithmetic) SMT-LIB v2
@@ -358,6 +375,7 @@ def parse_smtlib2_lia(smtlib2: str) -> Circuit:
 
     declared_bool: set[str] = set()
     declared_int: set[str] = set()
+    declared_array_int: set[str] = set()
     inputs: list[Variable] = []
     assertions: list[Assertion] = []
 
@@ -392,6 +410,8 @@ def parse_smtlib2_lia(smtlib2: str) -> Circuit:
                 return Variable(node, VariableType.BOOLEAN)
             if node in declared_int:
                 return Variable(node, VariableType.INTEGER)
+            if node in declared_array_int:
+                return Variable(node, VariableType.ARRAY)
             raise ValueError(f"Unknown symbol in QF_LIA expression: {node!r}")
 
         if not node:
@@ -485,6 +505,20 @@ def parse_smtlib2_lia(smtlib2: str) -> Circuit:
             new_env = {**env, **{b[0]: _expr(b[1], env) for b in bindings}}
             return _expr(body, new_env)
 
+        # --- Array operations ---
+        if head == "select":
+            # (select array index) → SelectExpression
+            arr = _expr(node[1], env)
+            idx = _expr(node[2], env)
+            return SelectExpression(arr, idx)
+
+        if head == "store":
+            # (store array index value) → StoreExpression (functional array update)
+            arr = _expr(node[1], env)
+            idx = _expr(node[2], env)
+            val = _expr(node[3], env)
+            return StoreExpression(arr, idx, val)
+
         raise ValueError(f"Unsupported QF_LIA operator: {head!r}")
 
     for form in forms:
@@ -504,6 +538,13 @@ def parse_smtlib2_lia(smtlib2: str) -> Circuit:
             elif sort == "Int":
                 declared_int.add(name)
                 inputs.append(Variable(name, VariableType.INTEGER))
+            elif isinstance(sort, list) and _is_supported_array_sort(sort):
+                declared_array_int.add(name)
+                v = Variable(name, VariableType.ARRAY)
+                v.meta_info['smt_sort'] = sort
+                inputs.append(v)
+            elif isinstance(sort, list):
+                raise NotImplementedError(f"Unsupported array/compound sort in QF_ANIA: {sort!r}")
             else:
                 raise ValueError(f"Unsupported sort in QF_LIA: {sort!r}")
             continue

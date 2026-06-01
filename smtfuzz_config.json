@@ -1,6 +1,6 @@
 {
   "strategy": "noinc",
-  "logic": ["QF_LIA", "QF_NIA"],
+  "logic": { "QF_ANIA": 0, "QF_NIA": 0.7, "QF_LIA": 0.3 },
   "seed": null,
   "cntsize": 10
 }

@@ -124,6 +124,7 @@ class VariableType(StrEnum):
     BOOLEAN = "Boolean"
     FIELD = "Field"
     INTEGER = "Integer"
+    ARRAY = "Array"
 
 
 @dataclass
@@ -293,6 +294,63 @@ class TernaryExpression(Expression):
             self.condition.node_size() + \
             self.if_expr.node_size() + \
             self.else_expr.node_size()
+
+
+@dataclass
+class SelectExpression(Expression):
+    """SMT (select array index) — array element access."""
+    array: 'Variable'
+    index: Expression
+
+    def copy(self) -> 'SelectExpression':
+        return SelectExpression(self.array.copy(), self.index.copy())
+
+    def __str__(self):
+        return f"(select {self.array} {self.index})"
+
+    def is_constant(self) -> bool:
+        return False
+
+    def contains_variables(self) -> bool:
+        return True
+
+    def is_boolean_expression(self) -> bool:
+        return False
+
+    def is_arithmetic_expression(self) -> bool:
+        return True
+
+    def node_size(self) -> int:
+        return 1 + self.array.node_size() + self.index.node_size()
+
+
+@dataclass
+class StoreExpression(Expression):
+    """SMT (store array index value) — returns new array with arr[index] = value."""
+    array: Expression
+    index: Expression
+    value: Expression
+
+    def copy(self) -> 'StoreExpression':
+        return StoreExpression(self.array.copy(), self.index.copy(), self.value.copy())
+
+    def __str__(self):
+        return f"(store {self.array} {self.index} {self.value})"
+
+    def is_constant(self) -> bool:
+        return False
+
+    def contains_variables(self) -> bool:
+        return True
+
+    def is_boolean_expression(self) -> bool:
+        return False
+
+    def is_arithmetic_expression(self) -> bool:
+        return True
+
+    def node_size(self) -> int:
+        return 1 + self.array.node_size() + self.index.node_size() + self.value.node_size()
 
 
 @dataclass

@@ -37,9 +37,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.smt_to_ir.parser import parse_smtlib2
 from src.backends.noir.ir2noir import IR2NoirVisitor, recompute_types, _type_bounds
 from src.backends.noir.emitter import EmitVisitor
-from src.backends.noir.types import IntegerType
+from src.backends.noir.types import IntegerType, ArrayType, BoolType
 from src.ir.nodes import VariableType
-from src.witnesses.generator import find_witness, build_type_bounds, _strip_check_commands
+from src.witnesses.generator import find_witness, build_type_bounds, _strip_check_commands, _eval_z3_lambda_body
 
 
 
@@ -88,8 +88,8 @@ def build_safe_math_source(fns_needed: set[tuple[str, int, bool]]) -> str:
 # Prover.toml generation
 # ---------------------------------------------------------------------------
 
-def _var_toml_value(var, model: dict[str, tuple[str, str]] | None, boundary_val: str | None = None) -> str:
-    """Return the TOML value string for a single variable."""
+def _var_toml_value(var, model: dict | None, boundary_val: str | None = None) -> str:
+    """Return the TOML value string for a single scalar variable (non-array)."""
     name = var.name
     if var.variable_type == VariableType.BOOLEAN:
         if model and name in model:
@@ -97,11 +97,78 @@ def _var_toml_value(var, model: dict[str, tuple[str, str]] | None, boundary_val:
         return boundary_val or "false"
     else:
         if model and name in model:
-            raw = model[name][1]
+            entry = model[name]
+            raw = entry[1] if isinstance(entry[1], str) else "0"
             if raw.startswith("ff"):
                 raw = raw[2:]
             return f'"{raw}"'
         return f'"{boundary_val}"' if boundary_val else '"0"'
+
+
+def _materialize_array_toml(array_val, noir_type: ArrayType) -> str:
+    """Recursively materialize a Z3 array model value as a Prover.toml string."""
+    size = noir_type.size
+    elem_type = noir_type.element_type
+
+    # Lambda: Z3 returned (lambda ((x!1 Int)) body) — evaluate body for each index.
+    if isinstance(array_val, tuple) and len(array_val) == 3 and array_val[0] == "lambda":
+        _, var, body = array_val
+        vals = []
+        for i in range(size):
+            v = _eval_z3_lambda_body(body, var, i)
+            if isinstance(elem_type, ArrayType):
+                vals.append(_materialize_array_toml({-1: v}, elem_type))
+            elif isinstance(elem_type, BoolType):
+                vals.append("true" if v else "false")
+            else:
+                vals.append(f'"{v}"')
+        return "[" + ", ".join(vals) + "]"
+
+    default = array_val.get(-1, 0) if isinstance(array_val, dict) else 0
+    vals = []
+    for i in range(size):
+        v = array_val.get(i, default) if isinstance(array_val, dict) else default
+        if isinstance(elem_type, ArrayType):
+            inner_dict = v if isinstance(v, dict) else ({-1: v} if isinstance(v, int) else {-1: 0})
+            vals.append(_materialize_array_toml(inner_dict, elem_type))
+        elif isinstance(elem_type, BoolType):
+            vals.append("true" if v else "false")
+        else:
+            vals.append(f'"{v if isinstance(v, int) else 0}"')
+    return "[" + ", ".join(vals) + "]"
+
+
+def _materialize_boundary_array(noir_type: ArrayType, rng: random.Random) -> str:
+    """Recursively generate boundary-value array as a Prover.toml string."""
+    size = noir_type.size
+    elem_type = noir_type.element_type
+    vals = []
+    for _ in range(size):
+        if isinstance(elem_type, ArrayType):
+            vals.append(_materialize_boundary_array(elem_type, rng))
+        elif isinstance(elem_type, BoolType):
+            vals.append(rng.choice(["true", "false"]))
+        elif isinstance(elem_type, IntegerType):
+            lo, hi = _type_bounds(elem_type)
+            pool = sorted(set(v for v in [lo, lo + 1, -1, 0, 1, hi - 1, hi] if lo <= v <= hi))
+            vals.append(f'"{rng.choice(pool)}"')
+        else:
+            vals.append('"0"')
+    return "[" + ", ".join(vals) + "]"
+
+
+def _array_toml_value(var, model: dict | None) -> str:
+    """Return the TOML value string for an array variable."""
+    name = var.name
+    noir_type = var.noir_type if isinstance(var.noir_type, ArrayType) else None
+    if model and name in model:
+        entry = model[name]
+        if entry[0] == "Array" and isinstance(entry[1], dict) and noir_type is not None:
+            return _materialize_array_toml(entry[1], noir_type)
+    if noir_type is not None:
+        return _materialize_array_toml({-1: 0}, noir_type)
+    size = var.meta_info.get('array_size', 8)
+    return "[" + ", ".join(['"0"'] * size) + "]"
 
 
 def model_to_prover_toml(
@@ -177,7 +244,10 @@ def model_to_prover_toml(
                 vals = ", ".join(_var_toml_value(v, model) for _, v in members)
                 flat_lines.append(f"{_pname(param)} = [{vals}]")
         elif name not in sm:
-            flat_lines.append(f"{_pname(name)} = {_var_toml_value(var, model)}")
+            if var.variable_type == VariableType.ARRAY:
+                flat_lines.append(f"{_pname(name)} = {_array_toml_value(var, model)}")
+            else:
+                flat_lines.append(f"{_pname(name)} = {_var_toml_value(var, model)}")
 
     # Build struct blocks, including nested leaves as struct fields.
     struct_blocks: dict[str, list[str]] = {}
@@ -352,6 +422,10 @@ def compute_groupings(
     buckets = ["flat", "struct_0", "struct_1", "array_0", "array_1", "tuple_0", "tuple_1"]
     assignments: dict[str, str] = {}
     for var in circuit.inputs:
+        if var.variable_type == VariableType.ARRAY:
+            # SMT array variables are already arrays — keep them flat (top-level params)
+            assignments[var.name] = "flat"
+            continue
         choice = rng.choice(buckets)
         if choice.startswith("array") and var.variable_type != VariableType.BOOLEAN:
             choice = "flat"
@@ -456,18 +530,37 @@ def compute_groupings(
 
 def generate_smt(config: dict, timeout: int = 30) -> str:
     """Call smtfuzz with flags from config dict and return the generated formula.
-    List values are resolved by picking one element at random (allows e.g. multiple logics)."""
-    cmd = ["smtfuzz"]
-    for key, value in config.items():
-        if value is None:
-            continue
-        if isinstance(value, list):
-            value = random.choice(value)
-        cmd += [f"--{key}", str(value)]
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if proc.returncode != 0:
-        raise RuntimeError(f"smtfuzz failed: {proc.stderr.strip()}")
-    return proc.stdout
+    List values are resolved by picking one element at random (allows e.g. multiple logics).
+    Re-rolls up to 20 times if the formula contains array sorts our parser cannot handle
+    (non-Int index, Bool-indexed, or nested-array-indexed arrays)."""
+    import re
+    # Matches any (Array X ...) where X is not 'Int' — catches Bool-indexed,
+    # nested-array-indexed, and other unsupported index sorts.
+    _BAD_ARRAY_SORT = re.compile(r'\(Array\s+(?!Int[\s)])' )
+
+    def _build_cmd() -> list[str]:
+        cmd = ["smtfuzz"]
+        for key, value in config.items():
+            if value is None:
+                continue
+            if isinstance(value, dict):
+                value = random.choices(list(value.keys()), weights=list(value.values()), k=1)[0]
+            elif isinstance(value, list):
+                value = random.choice(value)
+            cmd += [f"--{key}", str(value)]
+        return cmd
+
+    for _ in range(20):
+        proc = subprocess.run(_build_cmd(), capture_output=True, text=True, timeout=timeout)
+        if proc.returncode != 0:
+            raise RuntimeError(f"smtfuzz failed: {proc.stderr.strip()}")
+        formula = proc.stdout
+        if not _BAD_ARRAY_SORT.search(formula):
+            return formula
+    # If every attempt had an unsupported sort, return the last one and let the
+    # parser reject it normally (avoids an infinite loop when the config always
+    # produces unsupported sorts).
+    return formula
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +648,15 @@ def build_boundary_prover_toml(
                 members = sorted(tuple_contents[param], key=lambda x: x[0])
                 flat_lines.append(f"{_pname(param)} = [{', '.join(_bfmt(v) for _, v in members)}]")
         elif name not in sm:
-            flat_lines.append(f"{_pname(name)} = {_bfmt(var)}")
+            if var.variable_type == VariableType.ARRAY:
+                if isinstance(var.noir_type, ArrayType):
+                    flat_lines.append(f"{_pname(name)} = {_materialize_boundary_array(var.noir_type, rng)}")
+                else:
+                    size = var.meta_info.get('array_size', 8)
+                    vals = ', '.join(f'"{rng.randint(-(2**62), 2**62 - 1)}"' for _ in range(size))
+                    flat_lines.append(f"{_pname(name)} = [{vals}]")
+            else:
+                flat_lines.append(f"{_pname(name)} = {_bfmt(var)}")
 
     struct_blocks: dict[str, list[str]] = {}
     for var in circuit.inputs:
@@ -809,6 +910,7 @@ def main() -> None:
     (errors_dir / "error").mkdir(parents=True, exist_ok=True)
     (errors_dir / "overflow").mkdir(parents=True, exist_ok=True)
     (errors_dir / "timeout").mkdir(parents=True, exist_ok=True)
+    (errors_dir / "parse-errors").mkdir(parents=True, exist_ok=True)
     (errors_dir / "smt_solver_errors").mkdir(parents=True, exist_ok=True)
     (errors_dir / "z3_error_cvc5_succ").mkdir(parents=True, exist_ok=True)
     (errors_dir / "sat_to_unsat_pipeline").mkdir(parents=True, exist_ok=True)
@@ -852,6 +954,10 @@ def main() -> None:
                 except Exception as exc:
                     print(f"  [smtfuzz] generation error: {exc}")
                     continue
+                try:
+                    parse_smtlib2(content)
+                except Exception:
+                    continue  # silently retry; parse failures don't count
                 yield f"gen-{idx:04d}", content
                 idx += 1
 
@@ -885,10 +991,11 @@ def main() -> None:
         try:
             circuit = parse_smtlib2(smt_content)
         except Exception as exc:
+            # In generate mode this path is unreachable (_iter_formulas pre-validates).
+            # In folder mode, save to parse-errors and count as an error.
             print(f"  ERROR (parse error): {exc}")
             sat_error += 1
-            # Store as error with only the smt file (no Noir source yet).
-            dest = errors_dir / "error" / f"obj.{stem}-parse"
+            dest = errors_dir / "parse-errors" / f"obj.{stem}-parse"
             dest.mkdir(parents=True, exist_ok=True)
             (dest / smt_filename).write_text(smt_content)
             (dest / "nargo_output.txt").write_text(f"PARSE ERROR: {exc}\n")
@@ -897,7 +1004,8 @@ def main() -> None:
         declared = {v.name for v in circuit.inputs}
         int_var_names = [v.name for v in circuit.inputs if v.variable_type == VariableType.INTEGER]
 
-        recompute_types(circuit, smt_content, sample_int_type=gen_config.get("sample_int_type", True))
+        recompute_types(circuit, smt_content, sample_int_type=gen_config.get("sample_int_type", True),
+                        integer_signedness=gen_config.get("integer_signedness", "signed"))
         _type_bounds_clauses = build_type_bounds(circuit)
         if int_var_names:
             types_summary = ", ".join(

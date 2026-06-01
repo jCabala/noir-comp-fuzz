@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-ACIR SMT Oracle — translates ACIR constraints (BLACKBOX::RANGE + ASSERT only)
-to QF_NIA SMT with modular arithmetic over the BN254 prime field, then checks
-satisfiability with Z3.
+ACIR SMT Oracle — translates ACIR constraints to QF_ANIA SMT with modular
+arithmetic over the BN254 prime field, then checks satisfiability with Z3.
 
-Skips all BRILLIG CALL lines entirely.
+Handles: BLACKBOX::RANGE, ASSERT, INIT, READ, WRITE.
+Skips: BRILLIG CALL (unconstrained hints).
 
 Usage:
     python scripts/acir_smt_oracle.py <project_dir> [options]
@@ -114,6 +114,15 @@ def parse_assert(line: str) -> tuple[str, str] | None:
 def build_smt(funcs) -> str:
     range_bits: dict[str, int] = {}
     assert_pairs: list[tuple[str, str]] = []
+    # Memory: block_name -> list of witness names (in order)
+    mem_inits: dict[str, list[str]] = {}
+    # Reads: (result_witness, block_name, index_witness)
+    mem_reads: list[tuple[str, str, str]] = []
+    # Writes: (block_name, index_witness, value_witness) -> new block version name
+    mem_writes: list[tuple[str, str, str, str]] = []  # (old_block, idx, val, new_block)
+
+    # Track the current "live" version of each block for sequential writes.
+    block_version: dict[str, str] = {}
 
     for func in funcs:
         if func.is_brillig:
@@ -127,17 +136,52 @@ def build_smt(funcs) -> str:
                 pair = parse_assert(raw)
                 if pair:
                     assert_pairs.append(pair)
+            elif kind == "MEM_INIT":
+                # INIT b0 = [w0, w1, w2, ...]
+                m = re.match(r"INIT (b\d+) = \[([^\]]*)\]", raw)
+                if m:
+                    block = m.group(1)
+                    witnesses = [w.strip() for w in m.group(2).split(",") if w.strip()]
+                    mem_inits[block] = witnesses
+                    block_version[block] = block
+            elif kind == "MEM_READ":
+                # READ wN = b0[wM]
+                m = re.match(r"READ (w\d+) = (b\d+)\[(w\d+)\]", raw)
+                if m:
+                    result, block, idx = m.group(1), m.group(2), m.group(3)
+                    live = block_version.get(block, block)
+                    mem_reads.append((result, live, idx))
+            elif kind == "MEM_WRITE":
+                # WRITE b0[wM] = wN
+                m = re.match(r"WRITE (b\d+)\[(w\d+)\] = (w\d+)", raw)
+                if m:
+                    block, idx, val = m.group(1), m.group(2), m.group(3)
+                    old = block_version.get(block, block)
+                    new = f"{block}_v{len(mem_writes)}"
+                    mem_writes.append((old, idx, val, new))
+                    block_version[block] = new
 
-    # Collect all witnesses referenced in RANGE or ASSERT opcodes only
+    # Collect all witnesses
     all_witnesses: set[str] = set(range_bits.keys())
     for lhs, rhs in assert_pairs:
         all_witnesses |= set(re.findall(r"w\d+", lhs))
         all_witnesses |= set(re.findall(r"w\d+", rhs))
+    for witnesses in mem_inits.values():
+        all_witnesses |= set(witnesses)
+    for result, block, idx in mem_reads:
+        all_witnesses |= {result, idx}
+    for old, idx, val, new in mem_writes:
+        all_witnesses |= {idx, val}
+
+    # All array block names (including write versions)
+    all_blocks: set[str] = set(mem_inits.keys())
+    for old, idx, val, new in mem_writes:
+        all_blocks.add(new)
 
     lines = [
-        "; ACIR SMT Oracle — QF_NIA mod BN254",
+        "; ACIR SMT Oracle — QF_ANIA mod BN254",
         f"; prime = {BN254_PRIME}",
-        "(set-logic QF_NIA)",
+        "(set-logic QF_ANIA)",
         "",
     ]
 
@@ -148,9 +192,37 @@ def build_smt(funcs) -> str:
         lines.append(f"(assert (>= {w} 0))")
         lines.append(f"(assert (< {w} {upper}))")
 
+    # Declare array blocks
+    if all_blocks:
+        lines.append("")
+        lines.append("; Array blocks")
+        for b in sorted(all_blocks):
+            lines.append(f"(declare-fun {b} () (Array Int Int))")
+
+    # INIT: assert each element equals its witness
+    if mem_inits:
+        lines.append("")
+        lines.append("; INIT constraints")
+        for block, witnesses in mem_inits.items():
+            for i, w in enumerate(witnesses):
+                lines.append(f"(assert (= (select {block} {i}) {w}))")
+
+    # WRITE: each write produces a new array version via store
+    if mem_writes:
+        lines.append("")
+        lines.append("; WRITE constraints")
+        for old, idx, val, new in mem_writes:
+            lines.append(f"(assert (= {new} (store {old} {idx} {val})))")
+
+    # READ: result = select(block, index)
+    if mem_reads:
+        lines.append("")
+        lines.append("; READ constraints")
+        for result, block, idx in mem_reads:
+            lines.append(f"(assert (= {result} (select {block} {idx})))")
+
     lines.append("")
     lines.append("; ASSERT constraints (mod prime)")
-
     for lhs, rhs in assert_pairs:
         lhs_smt = poly_to_smt(parse_poly(lhs))
         rhs_smt = poly_to_smt(parse_poly(rhs))

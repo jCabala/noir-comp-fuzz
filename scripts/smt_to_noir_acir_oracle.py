@@ -239,7 +239,8 @@ def main() -> None:
     sat_to_unsat_dir.mkdir(parents=True, exist_ok=True)
     for cat in ("error", "overflow", "timeout", "smt_solver_errors",
                 "z3_error_cvc5_succ", "sat_to_unsat_pipeline", "unsat_pipeline",
-                "bb_prove_error", "bb_verify_error", "acir_oracle_violation"):
+                "bb_prove_error", "bb_verify_error", "acir_oracle_violation",
+                "parse_errors"):
         (errors_dir / cat).mkdir(parents=True, exist_ok=True)
 
     all_runs = sorted(output_dir.glob("run-*"))
@@ -293,14 +294,15 @@ def main() -> None:
         except Exception as exc:
             locked_print(f"  ERROR (parse error): {exc}")
             inc("sat_error")
-            dest = errors_dir / "error" / f"obj.{stem}-parse"
+            dest = errors_dir / "parse_errors" / f"obj.{stem}-parse"
             dest.mkdir(parents=True, exist_ok=True)
             (dest / smt_filename).write_text(smt_content)
             (dest / "nargo_output.txt").write_text(f"PARSE ERROR: {exc}\n")
             return
 
         int_var_names = [v.name for v in circuit.inputs if v.variable_type == VariableType.INTEGER]
-        recompute_types(circuit, smt_content, sample_int_type=gen_config.get("sample_int_type", True))
+        recompute_types(circuit, smt_content, sample_int_type=gen_config.get("sample_int_type", True),
+                        integer_signedness=gen_config.get("integer_signedness", "signed"))
         _type_bounds_clauses = build_type_bounds(circuit)
         if int_var_names:
             types_summary = ", ".join(

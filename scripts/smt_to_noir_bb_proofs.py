@@ -376,7 +376,8 @@ def main() -> None:
             return
 
         int_var_names = [v.name for v in circuit.inputs if v.variable_type == VariableType.INTEGER]
-        recompute_types(circuit, smt_content, sample_int_type=gen_config.get("sample_int_type", True))
+        recompute_types(circuit, smt_content, sample_int_type=gen_config.get("sample_int_type", True),
+                        integer_signedness=gen_config.get("integer_signedness", "signed"))
         _type_bounds_clauses = build_type_bounds(circuit)
         if int_var_names:
             types_summary = ", ".join(

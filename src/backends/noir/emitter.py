@@ -234,7 +234,12 @@ class EmitVisitor:
 
     def visit_array_index_expression(self, node: ArrayIndexExpression):
         self.visit(node.array)
-        self.buffer.write(f"[{node.index}]")
+        if isinstance(node.index, int):
+            self.buffer.write(f"[{node.index}]")
+        else:
+            self.buffer.write("[")
+            self.visit(node.index)
+            self.buffer.write("]")
 
     def visit_document(self, node: Document):
         for mod in node.submodules:

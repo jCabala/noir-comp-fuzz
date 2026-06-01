@@ -56,6 +56,9 @@ OPCODE_PATTERNS = [
     ("EXPRESSION",   re.compile(r"^EXPRESSION ")),
     ("MEMORY_INIT",  re.compile(r"^MEMORY INIT")),
     ("MEMORY_OP",    re.compile(r"^MEMORY OP")),
+    ("MEM_INIT",     re.compile(r"^INIT ")),
+    ("MEM_READ",     re.compile(r"^READ ")),
+    ("MEM_WRITE",    re.compile(r"^WRITE ")),
 ]
 
 OPCODE_COLORS = {
@@ -65,6 +68,9 @@ OPCODE_COLORS = {
     "EXPRESSION":   MAGENTA,
     "MEMORY_INIT":  BLUE,
     "MEMORY_OP":    BLUE,
+    "MEM_INIT":     BLUE,
+    "MEM_READ":     BLUE,
+    "MEM_WRITE":    BLUE,
 }
 
 def classify(line: str) -> str:

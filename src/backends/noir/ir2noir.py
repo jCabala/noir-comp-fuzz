@@ -27,9 +27,135 @@ def _collect_used_variables(expr) -> list:
             _walk(node.lhs); _walk(node.rhs)
         elif isinstance(node, _IR.TernaryExpression):
             _walk(node.condition); _walk(node.if_expr); _walk(node.else_expr)
+        elif isinstance(node, _IR.SelectExpression):
+            _walk(node.array); _walk(node.index)
+        elif isinstance(node, _IR.StoreExpression):
+            _walk(node.array); _walk(node.index); _walk(node.value)
 
     _walk(expr)
     return result
+
+
+def _collect_array_offsets(circuit: IRNodes.Circuit) -> dict[str, int]:
+    """For each root array variable, return the shift needed to make all constant
+    depth-0 indices non-negative.  offset = max(0, -min_constant_index_seen)."""
+    mins: dict[str, int] = {}
+
+    def _root(node):
+        if isinstance(node, IRNodes.Variable) and node.variable_type == IRNodes.VariableType.ARRAY:
+            return node.name
+        if isinstance(node, IRNodes.StoreExpression):
+            return _root(node.array)
+        return None
+
+    def _walk(node) -> None:
+        if isinstance(node, (IRNodes.SelectExpression, IRNodes.StoreExpression)):
+            r = _root(node.array)
+            if r is not None and isinstance(node.index, IRNodes.Integer) and node.index.value < 0:
+                mins[r] = min(mins.get(r, 0), node.index.value)
+            _walk(node.index)
+            if isinstance(node, IRNodes.StoreExpression):
+                _walk(node.value)
+        elif isinstance(node, IRNodes.BinaryExpression):
+            _walk(node.lhs); _walk(node.rhs)
+        elif isinstance(node, IRNodes.UnaryExpression):
+            _walk(node.value)
+        elif isinstance(node, IRNodes.TernaryExpression):
+            _walk(node.condition); _walk(node.if_expr); _walk(node.else_expr)
+        elif isinstance(node, IRNodes.Assertion):
+            _walk(node.value)
+        elif isinstance(node, IRNodes.Assume):
+            _walk(node.condition)
+        elif isinstance(node, IRNodes.Assignment):
+            _walk(node.rhs)
+
+    for stmt in circuit.statements:
+        _walk(stmt)
+    return {name: -v for name, v in mins.items()}
+
+
+def _collect_array_sizes(circuit: IRNodes.Circuit,
+                         offsets: dict[str, int] | None = None) -> dict[str, list[int]]:
+    """For each array variable, collect the minimum required size at each nesting depth.
+    Returns {var_name: [size_depth_0, size_depth_1, ...]}.
+    Defaults to 8 at any depth with no observed constant indices.
+    If offsets is provided, constant indices are shifted before computing sizes so that
+    negative-index accesses contribute to the correct (larger) size."""
+    _offsets = offsets or {}
+    sizes: dict[str, list[int]] = {}
+
+    def _update(name: str, depth: int, min_size: int) -> None:
+        sizes.setdefault(name, [])
+        while len(sizes[name]) <= depth:
+            sizes[name].append(8)
+        sizes[name][depth] = max(sizes[name][depth], min_size)
+
+    def _walk_select(node) -> tuple[str | None, int]:
+        """Walk a select/store chain bottom-up.
+        Returns (root_var_name, depth_of_this_node_in_the_chain)."""
+        if isinstance(node, IRNodes.SelectExpression):
+            root, depth = _walk_select(node.array)
+            if root is not None:
+                if isinstance(node.index, IRNodes.Integer):
+                    shifted = node.index.value + (_offsets.get(root, 0) if depth == 0 else 0)
+                    _update(root, depth, max(shifted + 1, 8))
+                else:
+                    _update(root, depth, 8)
+            return root, depth + 1
+        if isinstance(node, IRNodes.StoreExpression):
+            root, depth = _walk_select(node.array)
+            if root is not None:
+                if isinstance(node.index, IRNodes.Integer):
+                    shifted = node.index.value + (_offsets.get(root, 0) if depth == 0 else 0)
+                    _update(root, depth, max(shifted + 1, 8))
+                else:
+                    _update(root, depth, 8)
+            return root, depth
+        if isinstance(node, IRNodes.Variable) and node.variable_type == IRNodes.VariableType.ARRAY:
+            return node.name, 0
+        return None, 0
+
+    def _walk(node) -> None:
+        if isinstance(node, IRNodes.SelectExpression):
+            _walk_select(node)
+            _walk(node.index)
+        elif isinstance(node, IRNodes.StoreExpression):
+            _walk_select(node)
+            _walk(node.index)
+            _walk(node.value)
+        elif isinstance(node, IRNodes.BinaryExpression):
+            _walk(node.lhs); _walk(node.rhs)
+        elif isinstance(node, IRNodes.UnaryExpression):
+            _walk(node.value)
+        elif isinstance(node, IRNodes.TernaryExpression):
+            _walk(node.condition); _walk(node.if_expr); _walk(node.else_expr)
+        elif isinstance(node, IRNodes.Assertion):
+            _walk(node.value)
+        elif isinstance(node, IRNodes.Assume):
+            _walk(node.condition)
+        elif isinstance(node, IRNodes.Assignment):
+            _walk(node.rhs)
+
+    for stmt in circuit.statements:
+        _walk(stmt)
+
+    for var in circuit.inputs:
+        if var.variable_type == IRNodes.VariableType.ARRAY:
+            sizes.setdefault(var.name, [8])
+    return sizes
+
+
+def _build_noir_array_type(smt_sort, sizes: list[int], depth: int = 0) -> ArrayType:
+    """Recursively build a Noir ArrayType from an SMT sort and per-depth sizes."""
+    outer_size = sizes[depth] if depth < len(sizes) else 8
+    val_sort = smt_sort[2]
+    if isinstance(val_sort, list) and val_sort[0] == "Array":
+        elem_type: NoirType = _build_noir_array_type(val_sort, sizes, depth + 1)
+    elif val_sort == "Bool":
+        elem_type = BoolType()
+    else:
+        elem_type = IntegerType(64, True)
+    return ArrayType(elem_type, outer_size)
 
 
 def _fold_expr_constant(expr) -> int | None:
@@ -60,10 +186,24 @@ def _min_signed_type(val: int) -> IntegerType:
     return IntegerType(64, True)
 
 
-_INT_TYPE_POOL = [
-    IntegerType(8,  True),  IntegerType(16, True),  IntegerType(32, True),  IntegerType(64, True),
-    IntegerType(8,  False), IntegerType(16, False), IntegerType(32, False), IntegerType(64, False),
-]
+# Default pool: unsigned, capped at u32.
+# - Signed types excluded: mixed-signedness comparisons require casts that wrap
+#   (e.g. u64 cast to i64 turns large values negative, making impossible constraints
+#   like 78 <= x <= 43 satisfiable via overflow).
+# - u64 excluded: array indices are cast to u32 in Noir, so a u64 >= 2^32 wraps to a
+#   small index and silently bypasses the ACIR bounds check (which operates on the cast
+#   value, not the original).  u32 fits exactly into u32, so index casts are lossless.
+_SIGNED_POOL   = [IntegerType(8, True),  IntegerType(16, True),  IntegerType(32, True),  IntegerType(64, True)]
+_UNSIGNED_POOL = [IntegerType(8, False), IntegerType(16, False), IntegerType(32, False)]
+_MIXED_POOL    = _SIGNED_POOL + _UNSIGNED_POOL
+
+def _make_int_type_pool(signedness: str) -> list[IntegerType]:
+    """Return the integer type pool for the given signedness config value."""
+    if signedness == "signed":
+        return _SIGNED_POOL
+    if signedness == "mixed":
+        return _MIXED_POOL
+    return _UNSIGNED_POOL  # default: "unsigned" (u8/u16/u32 only)
 
 def _type_bounds(t: IntegerType) -> tuple[int, int]:
     if t.signed:
@@ -73,11 +213,13 @@ def _type_bounds(t: IntegerType) -> tuple[int, int]:
     return 0, (2 ** (t.bits - 1)) - 1
 
 
-def _pick_const_type(val: int, rng: random.Random, sample: bool = True) -> IntegerType:
+def _pick_const_type(val: int, rng: random.Random, sample: bool = True,
+                     pool: list[IntegerType] | None = None) -> IntegerType:
     """Pick a random Noir type that can hold val. Negative values require signed types."""
     if not sample:
         return IntegerType(64, True)
-    valid = [t for t in _INT_TYPE_POOL
+    pool = pool if pool is not None else _SIGNED_POOL
+    valid = [t for t in pool
              if (t.signed or val >= 0) and _type_bounds(t)[0] <= val <= _type_bounds(t)[1]]
     return rng.choice(valid) if valid else IntegerType(64, True)
 
@@ -103,6 +245,10 @@ def _collect_var_const_ranges(circuit: IRNodes.Circuit) -> dict[str, tuple[int, 
             _walk(node.value)
         elif isinstance(node, IRNodes.TernaryExpression):
             _walk(node.condition); _walk(node.if_expr); _walk(node.else_expr)
+        elif isinstance(node, IRNodes.SelectExpression):
+            _walk(node.array); _walk(node.index)
+        elif isinstance(node, IRNodes.StoreExpression):
+            _walk(node.array); _walk(node.index); _walk(node.value)
         elif isinstance(node, IRNodes.Assertion):
             _walk(node.value)
         elif isinstance(node, IRNodes.Assume):
@@ -115,36 +261,104 @@ def _collect_var_const_ranges(circuit: IRNodes.Circuit) -> dict[str, tuple[int, 
     return ranges
 
 
-def _pick_var_type(name: str, const_ranges: dict, rng: random.Random, sample: bool = True) -> IntegerType:
+def _pick_var_type(name: str, const_ranges: dict, rng: random.Random, sample: bool = True,
+                   pool: list[IntegerType] | None = None) -> IntegerType:
     if not sample:
         return IntegerType(64, True)
+    pool = pool if pool is not None else _SIGNED_POOL
     min_c, max_c = const_ranges.get(name, (0, 0))
-    valid = [t for t in _INT_TYPE_POOL
+    valid = [t for t in pool
              if _type_bounds(t)[0] <= min_c and _type_bounds(t)[1] >= max_c]
     return rng.choice(valid) if valid else IntegerType(64, True)
 
 
-def recompute_types(circuit: IRNodes.Circuit, smt_content: str, sample_int_type: bool = True) -> None:
+def recompute_types(circuit: IRNodes.Circuit, smt_content: str, sample_int_type: bool = True,
+                    integer_signedness: str = "signed") -> None:
     """Assign Noir types to every expression in the circuit and store on expr.noir_type.
 
     Variable types are randomly assigned (seeded from smt_content) filtered by the
     constants they appear alongside. Integer literal types are also randomly chosen.
     All other expression types are propagated bottom-up.
     If sample_int_type is False, all integer variables and constants are forced to i64.
+    integer_signedness controls the pool: "signed", "unsigned", or "mixed".
+    QF_ANIA always uses unsigned u32-capped regardless of the config: signed types cause
+    cast-wrapping bugs in comparisons, and u64 wraps when cast to u32 for array indexing.
     """
+    if "QF_ANIA" in smt_content:
+        integer_signedness = "unsigned"
+    pool = _make_int_type_pool(integer_signedness)
     import hashlib as _hashlib
     seed = int(_hashlib.md5(smt_content.encode()).hexdigest(), 16)
     var_rng   = random.Random(seed)        # for input variable type assignment
     const_rng = random.Random(seed + 5)   # for integer literal type assignment
 
-    const_ranges = _collect_var_const_ranges(circuit)
+    const_ranges  = _collect_var_const_ranges(circuit)
+    array_offsets = _collect_array_offsets(circuit)
+    array_sizes   = _collect_array_sizes(circuit, array_offsets)
+    # Store offsets on the circuit so IR2NoirVisitor can apply them during emission.
+    circuit.array_offsets = array_offsets
+
+    # Unify sizes across arrays whose SMT sorts are compatible at any nesting depth.
+    #
+    # Case 1 — same sort, different outer sizes: two (Array Int Bool) arrays sized
+    # [bool;60] and [bool;8] cannot be compared with == in Noir.  Take the max.
+    #
+    # Case 2 — cross-level: an (Array Int (Array Int Bool)) outer array and a flat
+    # (Array Int Bool) inner array can appear in the same store, e.g.:
+    #   arr1 : (Array Int Bool)              -> [bool; 60]  (accessed at index 59)
+    #   arr2 : (Array Int (Array Int Bool))  -> [[bool; 8]; N]  (inner defaults to 8)
+    #   (store arr2 i arr1)  =>  assign [bool;60] into element slot typed [bool;8] -> error
+    # Fix: unify the outer size of arr1 with the inner (depth-1) size of arr2.
+    #
+    # Build a map: sort_key -> max depth-0 size seen across all arrays of that sort.
+    sort_max_size: dict[str, int] = {}
+    for var in circuit.inputs:
+        if var.variable_type == IRNodes.VariableType.ARRAY:
+            smt_sort = var.meta_info.get('smt_sort', ["Array", "Int", "Int"])
+            if smt_sort[1] == "Bool":
+                continue
+            key = str(smt_sort)
+            cur = array_sizes.get(var.name, [8])[0]
+            sort_max_size[key] = max(sort_max_size.get(key, 8), cur)
+
+    # Apply: for each array, unify every depth with the max size for that depth's sort.
+    for var in circuit.inputs:
+        if var.variable_type == IRNodes.VariableType.ARRAY:
+            smt_sort = var.meta_info.get('smt_sort', ["Array", "Int", "Int"])
+            if smt_sort[1] == "Bool":
+                continue
+            depths = list(array_sizes.get(var.name, [8]))
+            # depth 0: unify with all same-sort arrays
+            key0 = str(smt_sort)
+            depths[0] = sort_max_size.get(key0, depths[0])
+            # depth 1: if element sort is itself an array, unify with that sort's max
+            val_sort = smt_sort[2]
+            if isinstance(val_sort, list) and val_sort[0] == "Array" and val_sort[1] != "Bool":
+                key1 = str(val_sort)
+                if key1 in sort_max_size and len(depths) > 1:
+                    depths[1] = sort_max_size[key1]
+                elif key1 in sort_max_size:
+                    depths.append(sort_max_size[key1])
+            array_sizes[var.name] = depths
+
+    # Build and store the full Noir ArrayType for each array variable.
+    array_type_map: dict[str, ArrayType] = {}
+    for var in circuit.inputs:
+        if var.variable_type == IRNodes.VariableType.ARRAY:
+            smt_sort = var.meta_info.get('smt_sort', ["Array", "Int", "Int"])
+            # Bool-indexed arrays have exactly 2 elements (false→0, true→1).
+            depths = [2] if smt_sort[1] == "Bool" else array_sizes.get(var.name, [8])
+            var.noir_type = _build_noir_array_type(smt_sort, depths)
+            array_type_map[var.name] = var.noir_type
 
     # Pre-assign one type per variable name using circuit.inputs (one entry per name).
     # This ensures all occurrences of the same variable get the same type.
     var_type_map: dict[str, IntegerType] = {}
     for inp in circuit.inputs:
         if inp.variable_type == IRNodes.VariableType.INTEGER:
-            var_type_map[inp.name] = _pick_var_type(inp.name, const_ranges, var_rng, sample_int_type)
+            var_type_map[inp.name] = _pick_var_type(inp.name, const_ranges, var_rng, sample_int_type, pool)
+
+    _ELEM_TYPE = IntegerType(64, True)  # fixed element type for (Array Int Int)
 
     def _walk(expr: IRNodes.Expression) -> NoirType:
         # Post-order: children first.
@@ -154,14 +368,21 @@ def recompute_types(circuit: IRNodes.Circuit, smt_content: str, sample_int_type:
             _walk(expr.lhs); _walk(expr.rhs)
         elif isinstance(expr, IRNodes.TernaryExpression):
             _walk(expr.condition); _walk(expr.if_expr); _walk(expr.else_expr)
+        elif isinstance(expr, IRNodes.SelectExpression):
+            _walk(expr.array); _walk(expr.index)
+        elif isinstance(expr, IRNodes.StoreExpression):
+            _walk(expr.array); _walk(expr.index); _walk(expr.value)
 
         if isinstance(expr, IRNodes.Variable):
             if expr.variable_type == IRNodes.VariableType.INTEGER:
                 t: NoirType = var_type_map.get(expr.name, IntegerType(64, True))
+            elif expr.variable_type == IRNodes.VariableType.ARRAY:
+                # Use the authoritative map; expression-tree copies lack pre-built types.
+                t = array_type_map.get(expr.name) or (expr.noir_type if isinstance(expr.noir_type, ArrayType) else ArrayType(_ELEM_TYPE, 8))
             else:
                 t = BoolType()
         elif isinstance(expr, IRNodes.Integer):
-            t = _pick_const_type(expr.value, const_rng, sample_int_type)
+            t = _pick_const_type(expr.value, const_rng, sample_int_type, pool)
         elif isinstance(expr, IRNodes.Boolean):
             t = BoolType()
         elif isinstance(expr, IRNodes.UnaryExpression):
@@ -191,7 +412,7 @@ def recompute_types(circuit: IRNodes.Circuit, smt_content: str, sample_int_type:
                 if isinstance(t, IntegerType):
                     folded = _fold_expr_constant(expr)
                     if folded is not None and not (_type_bounds(t)[0] <= folded <= _type_bounds(t)[1]):
-                        valid = [tp for tp in _INT_TYPE_POOL
+                        valid = [tp for tp in pool
                                  if _type_bounds(tp)[0] <= folded <= _type_bounds(tp)[1]]
                         if valid:
                             t = _common_int_type(t, min(valid, key=lambda tp: tp.bits))
@@ -205,6 +426,14 @@ def recompute_types(circuit: IRNodes.Circuit, smt_content: str, sample_int_type:
                 t = rt
             else:
                 t = BoolType()
+        elif isinstance(expr, IRNodes.SelectExpression):
+            # Result type is the element type of the array.
+            arr_type = expr.array.noir_type
+            t = arr_type.element_type if isinstance(arr_type, ArrayType) else _ELEM_TYPE
+        elif isinstance(expr, IRNodes.StoreExpression):
+            # Result type is the same array type as the input.
+            arr_type = expr.array.noir_type
+            t = arr_type if isinstance(arr_type, ArrayType) else ArrayType(_ELEM_TYPE, 8)
         else:
             t = BoolType()
 
@@ -231,6 +460,11 @@ def _common_int_type(t1: IntegerType, t2: IntegerType) -> IntegerType:
         # Same width, mixed signedness: need one extra bit to stay lossless.
         bits = min(bits * 2, 64)
     return IntegerType(bits, signed)
+
+
+def _sanitize_noir_ident(name: str) -> str:
+    """Replace characters invalid in Noir identifiers (e.g. hyphens) with underscores."""
+    return name.replace("-", "_")
 
 
 class NameDispenser:
@@ -267,6 +501,10 @@ class IR2NoirVisitor:
         self._rng = rng
         # Maps base IntegerType str → alias name (populated in visit_circuit).
         self._type_alias_map: dict[str, str] = {}
+        # Maps root array variable name → index offset (to shift negative indices).
+        self._array_offset_map: dict[str, int] = {}
+        # Maps array variable name → authoritative ArrayType from circuit.inputs.
+        self._array_type_map: dict[str, ArrayType] = {}
 
     def transform(self, system: IRNodes.Circuit) -> Document:
         return self.visit_circuit(system)
@@ -307,6 +545,10 @@ class IR2NoirVisitor:
                 return self.visit_binary_expression(node)
             case IRNodes.TernaryExpression():
                 return self.visit_ternary_expression(node)
+            case IRNodes.SelectExpression():
+                return self.visit_select_expression(node)
+            case IRNodes.StoreExpression():
+                return self.visit_store_expression(node)
             case _:
                 raise NotImplementedError(f"unsupported expression node {node.__class__.__name__}")
 
@@ -359,7 +601,85 @@ class IR2NoirVisitor:
             param, idx = self._tuple_map[node.name]
             expr = TupleFieldAccess(Identifier(param), idx)
             return self._apply_nesting(param, expr), []
-        return Identifier(node.name), []
+        return Identifier(_sanitize_noir_ident(node.name)), []
+
+    @staticmethod
+    def _root_array_name(node) -> str | None:
+        """Walk through StoreExpression chains to find the root array Variable name."""
+        if isinstance(node, IRNodes.Variable) and node.variable_type == IRNodes.VariableType.ARRAY:
+            return node.name
+        if isinstance(node, IRNodes.StoreExpression):
+            return IR2NoirVisitor._root_array_name(node.array)
+        return None
+
+    def _apply_index_offset(self, index_node: IRNodes.Expression, idx_expr: Expression,
+                            root_name: str | None) -> Expression:
+        """Shift idx_expr by the per-array offset so all indices are non-negative."""
+        offset = self._array_offset_map.get(root_name, 0) if root_name else 0
+        if not offset:
+            return idx_expr
+        if isinstance(index_node, IRNodes.Integer):
+            return IntegerLiteral(index_node.value + offset)
+        # Variable index: cast to i64, add offset, result stays i64 for the later u32 cast.
+        return BinaryExpression(
+            Operator.ADD,
+            CastExpression(idx_expr, IntegerType(64, True)),
+            IntegerLiteral(offset),
+        )
+
+    def visit_select_expression(self, node: IRNodes.SelectExpression) -> tuple[Expression, list[Statement]]:
+        arr_expr, arr_stmts = self.visit_expression(node.array)
+        idx_expr, idx_stmts = self.visit_expression(node.index)
+        root_name = self._root_array_name(node.array)
+        idx_expr = self._apply_index_offset(node.index, idx_expr, root_name)
+        stmts = arr_stmts + idx_stmts
+        # Bounds check for non-literal indices: assert((idx as u64) < size) so that
+        # the ACIR constraint system rejects out-of-range accesses the same way nargo does.
+        if not isinstance(node.index, IRNodes.Integer):
+            arr_type = (self._array_type_map.get(root_name) if root_name else None) or self._expr_type(node.array)
+            if isinstance(arr_type, ArrayType):
+                oob_check = BinaryExpression(
+                    Operator.LTH,
+                    CastExpression(idx_expr, IntegerType(64, False)),
+                    CastExpression(IntegerLiteral(arr_type.size), IntegerType(64, False)),
+                )
+                stmts.append(AssertStatement(oob_check, StringLiteral("oob")))
+        # Noir requires u32 for array indices; also cast bool (false→0, true→1).
+        if isinstance(self._expr_type(node.index), (IntegerType, BoolType)):
+            idx_expr = CastExpression(idx_expr, IntegerType(32, False))
+        return ArrayIndexExpression(arr_expr, idx_expr), stmts
+
+    def visit_store_expression(self, node: IRNodes.StoreExpression) -> tuple[Expression, list[Statement]]:
+        arr_expr, arr_stmts = self.visit_expression(node.array)
+        idx_expr, idx_stmts = self.visit_expression(node.index)
+        val_expr, val_stmts = self.visit_expression(node.value)
+        root_name = self._root_array_name(node.array)
+        idx_expr = self._apply_index_offset(node.index, idx_expr, root_name)
+        # Prefer the authoritative array type from circuit.inputs over the
+        # _TypeAssignVisitor fallback (which may be [i64; 8] due to the
+        # expression-tree Variable identity issue).
+        arr_type = (self._array_type_map.get(root_name) if root_name else None) or self._expr_type(node)
+        stmts = arr_stmts + idx_stmts + val_stmts
+        # Bounds check for non-literal indices: assert((idx as u64) < size).
+        if not isinstance(node.index, IRNodes.Integer) and isinstance(arr_type, ArrayType):
+            oob_check = BinaryExpression(
+                Operator.LTH,
+                CastExpression(idx_expr, IntegerType(64, False)),
+                CastExpression(IntegerLiteral(arr_type.size), IntegerType(64, False)),
+            )
+            stmts.append(AssertStatement(oob_check, StringLiteral("oob")))
+        # Noir requires u32 for array indices; also cast bool (false→0, true→1).
+        if isinstance(self._expr_type(node.index), (IntegerType, BoolType)):
+            idx_expr = CastExpression(idx_expr, IntegerType(32, False))
+        if isinstance(arr_type, ArrayType):
+            elem_t = arr_type.element_type
+            val_t = self._expr_type(node.value)
+            if isinstance(elem_t, IntegerType) and isinstance(val_t, IntegerType) and elem_t != val_t:
+                val_expr = CastExpression(val_expr, elem_t)
+        tmp_name = self._name_dispenser.next("store")
+        stmts.append(LetStatement(tmp_name.copy(), arr_expr, arr_type, is_mutable=True))
+        stmts.append(AssignStatement(ArrayIndexExpression(tmp_name.copy(), idx_expr), val_expr))
+        return tmp_name, stmts
 
     def visit_boolean(self, node: IRNodes.Boolean) -> tuple[Expression, list[Statement]]:
         return BooleanLiteral(node.value), []
@@ -504,11 +824,11 @@ class IR2NoirVisitor:
         inner = self._is_abs_pattern(node)
         if inner is not None:
             t = self._expr_type(inner)
-            # Only use safe_abs for signed types. For unsigned, abs is the identity
-            # and the ternary's natural type is wider/signed (due to -x promotion),
-            # so let normal ternary handling emit the correct casts.
-            if isinstance(t, IntegerType) and t.signed:
+            if isinstance(t, IntegerType):
                 inner_expr, inner_stmts = self.visit_expression(inner)
+                if not t.signed:
+                    # Unsigned values are always >= 0; abs is a no-op.
+                    return inner_expr, inner_stmts
                 self.safe_fns_needed.add(("abs", t.bits, t.signed))
                 call = FunctionCall(Identifier(f"safe_math::abs_{t}"), [inner_expr])
                 return call, inner_stmts
@@ -543,7 +863,7 @@ class IR2NoirVisitor:
         self._mid_cache.clear()
 
         # Cast branches to the common type when they differ.
-        if lt is not None and rt is not None and lt != rt:
+        if isinstance(lt, IntegerType) and isinstance(rt, IntegerType) and lt != rt:
             common = _common_int_type(lt, rt)
             if lt != common:
                 if_expr = CastExpression(if_expr, common)
@@ -584,6 +904,18 @@ class IR2NoirVisitor:
         output_names = {o.name for o in node.outputs}
         statements: list[Statement] = []
 
+        # Pick up the per-array index offsets computed by recompute_types (or recompute
+        # here as a fallback for callers that skipped recompute_types).
+        self._array_offset_map = getattr(node, 'array_offsets', None) or _collect_array_offsets(node)
+
+        # Build an authoritative name→ArrayType map from circuit.inputs so that
+        # expression-tree Variable copies (which lack noir_type) resolve correctly.
+        self._array_type_map = {
+            v.name: v.noir_type
+            for v in node.inputs
+            if isinstance(v.noir_type, ArrayType)
+        }
+
         for out in node.outputs:
             out_type = self._type_from_var(out)
             default_value: Expression = BooleanLiteral(False) if isinstance(out_type, BoolType) else IntegerLiteral(0)
@@ -617,6 +949,8 @@ class IR2NoirVisitor:
         #  - globals extracted inside helpers end up in the Document
         flat_visitor._name_dispenser = self._name_dispenser
         flat_visitor.safe_fns_needed = self.safe_fns_needed
+        flat_visitor._array_offset_map = self._array_offset_map
+        flat_visitor._array_type_map = self._array_type_map
         # Each visitor has its own _mid_cache — scopes must not cross visitor boundaries.
         # (no global defs to share — global constant extraction removed)
 
@@ -636,7 +970,7 @@ class IR2NoirVisitor:
                         seen.add(v.name)
                         all_vars.append(v)
 
-            helper_params = [VariableDefinition(Identifier(v.name), self._type_from_var(v)) for v in all_vars]
+            helper_params = [VariableDefinition(Identifier(_sanitize_noir_ident(v.name)), self._type_from_var(v)) for v in all_vars]
             call_args = [self.visit_variable(v)[0] for v in all_vars]
 
             if len(group) == 1:
@@ -795,8 +1129,8 @@ class IR2NoirVisitor:
 
         def _noir_param_name(p: str) -> str:
             used = bool(param_to_ir_vars.get(p, set()) & used_ir_vars)
-            # Don't add '_' if name already starts with '_' — it's already marked unused.
-            name = p if (used or p.startswith("_")) else f"_{p}"
+            sanitized = _sanitize_noir_ident(p)
+            name = sanitized if (used or sanitized.startswith("_")) else f"_{sanitized}"
             self.param_name_map[p] = name
             return name
 
@@ -838,7 +1172,7 @@ class IR2NoirVisitor:
                     params.append(VariableDefinition(Identifier(_noir_param_name(param)), TupleType(all_types)))
                     seen_params.add(param)
             else:
-                params.append(VariableDefinition(Identifier(_noir_param_name(inp.name)), self._type_from_var(inp)))
+                params.append(VariableDefinition(Identifier(_sanitize_noir_ident(_noir_param_name(inp.name))), self._type_from_var(inp)))
 
         # --- Nested helper call chains ---
         # Each non-empty group is called exactly once — either from main or from one earlier group.
@@ -871,6 +1205,8 @@ class IR2NoirVisitor:
         #  - globals extracted inside helpers end up in the Document
         flat_visitor._name_dispenser = self._name_dispenser
         flat_visitor.safe_fns_needed = self.safe_fns_needed
+        flat_visitor._array_offset_map = self._array_offset_map
+        flat_visitor._array_type_map = self._array_type_map
         # Each visitor has its own _mid_cache — scopes must not cross visitor boundaries.
         # (no global defs to share — global constant extraction removed)
 
@@ -888,7 +1224,7 @@ class IR2NoirVisitor:
                         seen.add(v.name)
                         all_vars.append(v)
 
-            helper_params = [VariableDefinition(Identifier(v.name), self._type_from_var(v)) for v in all_vars]
+            helper_params = [VariableDefinition(Identifier(_sanitize_noir_ident(v.name)), self._type_from_var(v)) for v in all_vars]
             call_args = [self.visit_variable(v)[0] for v in all_vars]
 
             if len(group) == 1:
@@ -937,10 +1273,10 @@ class IR2NoirVisitor:
             parent_var_names = {v.name for v in p_vars}
             extra_vars = [v for v in c_vars if v.name not in parent_var_names]
             new_p_vars = p_vars + extra_vars
-            new_p_params = [VariableDefinition(Identifier(v.name), self._type_from_var(v)) for v in new_p_vars]
+            new_p_params = [VariableDefinition(Identifier(_sanitize_noir_ident(v.name)), self._type_from_var(v)) for v in new_p_vars]
             new_p_call_args = p_call_args + [self.visit_variable(v)[0] for v in extra_vars]
             # Build call to child inside parent's body.
-            child_inner_args = [Identifier(v.name) for v in c_vars]
+            child_inner_args = [Identifier(_sanitize_noir_ident(v.name)) for v in c_vars]
             child_call = FunctionCall(Identifier(c_fn.name.name), child_inner_args)
             child_stmt = (AssertStatement(child_call, StringLiteral(group_name))
                           if c_returns_bool
@@ -1013,6 +1349,12 @@ class IR2NoirVisitor:
             base = var.noir_type if isinstance(var.noir_type, IntegerType) else IntegerType(64, True)
             alias = self._type_alias_map.get(str(base))
             return AliasType(alias) if alias else base
+        if var.variable_type == IRNodes.VariableType.ARRAY:
+            if var.name in self._array_type_map:
+                return self._array_type_map[var.name]
+            if isinstance(var.noir_type, ArrayType):
+                return var.noir_type
+            return ArrayType(IntegerType(64, True), 8)
         return FieldType()
 
     def _infer_type(self, expr: IRNodes.Expression) -> NoirType:
